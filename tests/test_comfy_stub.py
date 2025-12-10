@@ -6,10 +6,11 @@ import io
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from comfyuidatalabel.comfy_server import app
+from comfyuidatalabel.comfy_server import app, stub
 
 
 def test_stub_returns_blank_image_and_health():
+    stub.reset()
     client = TestClient(app)
     assert client.get("/system_stats").status_code == 200
     assert client.get("/queue").status_code == 200

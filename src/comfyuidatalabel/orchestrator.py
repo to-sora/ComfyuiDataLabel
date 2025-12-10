@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import copy
 import itertools
 import random
 import time
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from uuid import uuid4
 
 import httpx
@@ -14,10 +15,28 @@ from sqlmodel import Session, select
 from .models import Annotation, Task, TaskPrompt, VariablePool, Worker, Workflow
 
 
+def _version_at_least(version: str, minimum: str) -> bool:
+    def _parts(value: str) -> List[int]:
+        return [int(part) for part in value.split(".") if part.isdigit()]
+
+    current_parts = _parts(version)
+    minimum_parts = _parts(minimum)
+    length = max(len(current_parts), len(minimum_parts))
+    current_parts.extend([0] * (length - len(current_parts)))
+    minimum_parts.extend([0] * (length - len(minimum_parts)))
+    return current_parts >= minimum_parts
+
+
 class WorkerRegistry:
     def __init__(self, session: Session, http_client: Client | None = None):
         self.session = session
         self.http_client = http_client or httpx.Client(timeout=2.5)
+
+    @staticmethod
+    def _headers(worker: Worker) -> Dict[str, str]:
+        if not worker.api_key:
+            return {}
+        return {"Authorization": f"Bearer {worker.api_key}", "X-API-Key": worker.api_key}
 
     def healthy_workers(self) -> List[Worker]:
         result = self.session.exec(
@@ -44,10 +63,28 @@ class WorkerRegistry:
         self.session.commit()
         self.session.refresh(worker)
 
-    def check_worker_health(self, worker: Worker, timeout: float = 2.5) -> Worker:
+    def check_worker_health(
+        self,
+        worker: Worker,
+        timeout: float = 2.5,
+        *,
+        min_version: str | None = None,
+        required_features: Sequence[str] | None = None,
+    ) -> Worker:
+        headers = self._headers(worker)
         try:
-            self.http_client.get(f"{worker.base_url}/system_stats")
-            self.http_client.get(f"{worker.base_url}/queue")
+            system_resp = self.http_client.get(f"{worker.base_url}/system_stats", headers=headers)
+            queue_resp = self.http_client.get(f"{worker.base_url}/queue", headers=headers)
+            system_resp.raise_for_status()
+            queue_resp.raise_for_status()
+            system_stats = system_resp.json()
+            if min_version and not _version_at_least(system_stats.get("version", "0.0.0"), min_version):
+                raise RuntimeError("Worker version is below the minimum supported")
+            if required_features:
+                features = set(system_stats.get("features", []))
+                missing = set(required_features) - features
+                if missing:
+                    raise RuntimeError(f"Missing required features: {', '.join(sorted(missing))}")
             worker.status = "HEALTHY"
         except Exception:
             worker.status = "UNHEALTHY"
@@ -190,24 +227,26 @@ class SmartOrchestrator:
         return worker
 
     def _generate_prompts(self, task: Task) -> List[Dict[str, object]]:
-        prompts: List[str]
+        prompts: List[Dict[str, object]]
         if task.prompt_template:
             prompts = self._prompts_from_pool(task)
         else:
             raise ValueError("prompt_template is required to generate prompts from pools")
         workflow = self._get_workflow(task.workflow_id)
         seeds: List[int] = [random.randint(1, 2**31 - 1) for _ in range(task.seeds_per_prompt * len(prompts))]
+        expanded = prompts * task.seeds_per_prompt
         return [
             {
-                "prompt": prompt,
+                "prompt": prompt.get("prompt", ""),
+                "applied_inputs": prompt.get("applied_inputs", {}),
                 "seed": seeds[idx],
                 "mode": "pilot" if idx < task.seeds_per_prompt else "mass",
                 "batch_size": min(task.batch_size, workflow.max_workflow_batch_size),
             }
-            for idx, prompt in enumerate(prompts * task.seeds_per_prompt)
+            for idx, prompt in enumerate(expanded)
         ]
 
-    def _prompts_from_pool(self, task: Task) -> List[str]:
+    def _prompts_from_pool(self, task: Task) -> List[Dict[str, object]]:
         if not task.variable_pool_id:
             raise ValueError("Variable pool is required when using prompt templates")
         pool = self.session.get(VariablePool, task.variable_pool_id)
@@ -219,10 +258,10 @@ class SmartOrchestrator:
             combos = itertools.product(*[variables[slot] for slot in slots])
         else:
             combos = zip(*[variables[slot] for slot in slots])
-        prompts: List[str] = []
+        prompts: List[Dict[str, object]] = []
         for combo in combos:
             prompt_vars = dict(zip(slots, combo))
-            prompts.append(task.prompt_template.format(**prompt_vars))
+            prompts.append({"prompt": task.prompt_template.format(**prompt_vars), "applied_inputs": {}})
             if len(prompts) >= task.target_prompts:
                 break
         if len(prompts) < task.target_prompts:
@@ -242,13 +281,18 @@ class SmartOrchestrator:
         workflow_graph = workflow.workflow_api.get("workflow", workflow.workflow_api)
         workflow_inputs = workflow.workflow_api.get("inputs", {})
         extra_data = workflow.workflow_api.get("extra_data", {})
+        workflow_with_overrides = self._with_overrides(workflow_inputs, prompt.applied_inputs)
         payload = {
             "prompt": workflow_graph,
             "client_id": client_id,
-            "workflow_api": workflow_inputs,
+            "workflow_api": workflow_with_overrides,
             "extra_data": extra_data,
         }
-        response = self.http_client.post(prompt.worker_endpoint, json=payload)
+        response = self.http_client.post(
+            prompt.worker_endpoint,
+            json=payload,
+            headers=WorkerRegistry._headers(worker),
+        )
         response.raise_for_status()
         prompt.status = "queued"
         prompt.client_id = client_id
@@ -271,9 +315,32 @@ class SmartOrchestrator:
             "status": prompt.status,
         }
 
+    @staticmethod
+    def _with_overrides(workflow_api: Dict[str, Any], overrides: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+        workflow = copy.deepcopy(workflow_api) if workflow_api is not None else {}
+        if not overrides:
+            return workflow
+        nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
+        if isinstance(nodes, list):
+            node_map = {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
+        elif isinstance(nodes, dict):
+            node_map = {str(node_id): node for node_id, node in nodes.items() if isinstance(node, dict)}
+        else:
+            node_map = {}
+
+        for node_id, inputs in overrides.items():
+            node = node_map.get(str(node_id))
+            if not node:
+                continue
+            current_inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+            current_inputs.update(inputs)
+            node["inputs"] = current_inputs
+        return workflow
+
     def _track_prompt(self, worker: Worker, prompt: TaskPrompt) -> None:
         queue_endpoint = f"{worker.base_url}/queue"
         history_endpoint = f"{worker.base_url}/history/{prompt.client_id}"
+        headers = WorkerRegistry._headers(worker)
         attempts = 0
         max_attempts = 10
         poll_interval = 0.25
@@ -281,13 +348,13 @@ class SmartOrchestrator:
             attempts += 1
             queue_status = {}
             try:
-                queue_status = self.http_client.get(queue_endpoint).json()
+                queue_status = self.http_client.get(queue_endpoint, headers=headers).json()
             except Exception:
                 pass
             self._update_status_from_queue(prompt, queue_status)
             history_payload = {}
             try:
-                history_payload = self.http_client.get(history_endpoint).json()
+                history_payload = self.http_client.get(history_endpoint, headers=headers).json()
             except Exception:
                 pass
             prompt_history = self._extract_prompt_history(history_payload, prompt.prompt_id)

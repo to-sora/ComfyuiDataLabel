@@ -75,6 +75,7 @@ class TaskPrompt(SQLModel, table=True):
     worker_endpoint: Optional[str] = None
     prompt_id: Optional[str] = None
     client_id: Optional[str] = None
+    applied_inputs: Dict[str, Dict[str, object]] = Field(default_factory=dict, sa_column=Column(JSON))
     node_outputs: Dict[str, object] = Field(default_factory=dict, sa_column=Column(JSON))
     batch_size: int = Field(default=1, gt=0)
     status: str = Field(default="queued")
