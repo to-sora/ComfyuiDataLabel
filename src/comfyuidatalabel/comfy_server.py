@@ -45,8 +45,10 @@ def _blank_image(width: int = 512, height: int = 512) -> str:
 
 class PromptRequest(BaseModel):
     workflow_api: dict = Field(default_factory=dict)
-    prompt: str
-    seed: int
+    prompt: dict
+    client_id: str = Field(default_factory=lambda: "client-unknown")
+    extra_data: dict = Field(default_factory=dict)
+    seed: int | None = None
     batch_size: int = 1
 
 
@@ -98,6 +100,10 @@ class ComfyStub:
         prompt = self.prompts[prompt_id]
         prompt["status"] = status
         prompt["updated_at"] = time.time()
+        if status == "running":
+            prompt["started_at"] = prompt.get("started_at") or prompt["updated_at"]
+        if status == "completed":
+            prompt["completed_at"] = prompt.get("completed_at") or prompt["updated_at"]
         if images is not None:
             prompt["images"] = images
         if status == "running":
@@ -137,7 +143,7 @@ class ComfyStub:
             body: PromptRequest, request: Request, background_tasks: BackgroundTasks
         ):
             self._validate_auth(dict(request.headers))
-            prompt_id = f"job-{body.seed}-{len(self.prompts) + 1}"
+            prompt_id = f"job-{(body.seed or 0)}-{len(self.prompts) + 1}"
             self.prompts[prompt_id] = {
                 "prompt_id": prompt_id,
                 "status": "queued",
@@ -145,6 +151,8 @@ class ComfyStub:
                 "prompt": body.prompt,
                 "seed": body.seed,
                 "batch_size": body.batch_size,
+                "client_id": body.client_id,
+                "extra_data": body.extra_data,
                 "created_at": time.time(),
             }
             self.queue_pending.append(prompt_id)

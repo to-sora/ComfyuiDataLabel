@@ -20,7 +20,7 @@ def test_stub_returns_blank_image_and_health():
         hello = ws.receive_json()
         assert hello["type"] == "hello"
 
-        payload = {"workflow_api": {}, "prompt": "hello", "seed": 42, "batch_size": 1}
+        payload = {"workflow_api": {}, "prompt": {"1": {"id": 1}}, "seed": 42, "batch_size": 1}
         resp = client.post("/prompt", json=payload)
         assert resp.status_code == 200
         prompt_id = resp.json()["prompt_id"]

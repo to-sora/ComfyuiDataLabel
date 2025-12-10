@@ -145,7 +145,7 @@ def test_worker_health_checks_require_version_and_api_key():
 def test_prompt_history_progresses():
     stub.reset()
     http_client = comfy_stub_client()
-    payload = {"workflow_api": {}, "prompt": "integration", "seed": 7, "batch_size": 1}
+    payload = {"workflow_api": {}, "prompt": {"1": {"id": 1}}, "seed": 7, "batch_size": 1}
     resp = http_client.post("/prompt", json=payload)
     prompt_id = resp.json()["prompt_id"]
 

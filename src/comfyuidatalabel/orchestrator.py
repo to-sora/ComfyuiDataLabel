@@ -6,7 +6,8 @@ import json
 import random
 import time
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+from uuid import uuid4
 
 import httpx
 from httpx import Client
@@ -297,26 +298,30 @@ class SmartOrchestrator:
 
     def _simulate_comfy_call(self, worker: Worker, workflow: Workflow, prompt: TaskPrompt) -> Dict[str, str]:
         prompt.worker_endpoint = f"{worker.base_url}/prompt"
-        payload = {
-            "workflow_api": self._with_overrides(workflow.workflow_api, prompt.applied_inputs),
-            "prompt": prompt.prompt,
-            "seed": prompt.seed,
-            "batch_size": prompt.batch_size,
+        prompt.client_id = prompt.client_id or prompt.task.client_id or f"client-{uuid4()}"
+        workflow_graph = self._with_overrides(workflow.workflow_api, prompt.applied_inputs)
+        prompt_payload = self._graph_keyed_by_node(workflow_graph)
+        payload: Dict[str, Any] = {
+            "prompt": prompt_payload,
+            "client_id": prompt.client_id,
+            "workflow_api": workflow_graph,
+            "extra_data": prompt.task.extra_data or {},
         }
-        if prompt.task.client_id:
-            payload["client_id"] = prompt.task.client_id
-        if prompt.task.extra_data:
-            payload["extra_data"] = prompt.task.extra_data
+
         response = self.http_client.post(
             prompt.worker_endpoint,
             json=payload,
             headers=WorkerRegistry._headers(worker),
         )
         response.raise_for_status()
-        prompt.status = "queued"
+        result = response.json()
+        prompt.prompt_id = result.get("prompt_id") or prompt.prompt_id
+        prompt.status = result.get("status", "queued")
+        prompt.queued_at = datetime.utcnow()
+        prompt.updated_at = datetime.utcnow()
         self.session.add(prompt)
         self.session.commit()
-        result = response.json()
+        self._track_prompt(worker, prompt)
         return {
             "worker": worker.base_url,
             "workflow": workflow.name,
@@ -325,7 +330,9 @@ class SmartOrchestrator:
             "mode": prompt.mode,
             "batch_size": str(prompt.batch_size),
             "endpoint": prompt.worker_endpoint,
-            "prompt_id": result.get("prompt_id", ""),
+            "prompt_id": prompt.prompt_id or "",
+            "client_id": prompt.client_id or "",
+            "status": prompt.status,
         }
 
     @staticmethod
@@ -349,3 +356,63 @@ class SmartOrchestrator:
             current_inputs.update(inputs)
             node["inputs"] = current_inputs
         return workflow
+
+    @staticmethod
+    def _graph_keyed_by_node(workflow_api: Dict[str, Any]) -> Dict[str, Any]:
+        nodes = workflow_api.get("nodes") if isinstance(workflow_api, dict) else None
+        if isinstance(nodes, list):
+            return {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
+        if isinstance(nodes, dict):
+            return {str(node_id): node for node_id, node in nodes.items() if isinstance(node, dict)}
+        return {}
+
+    def _track_prompt(self, worker: Worker, prompt: TaskPrompt, timeout: float = 2.0) -> None:
+        if not prompt.prompt_id:
+            return
+        headers = WorkerRegistry._headers(worker)
+        start = time.time()
+        last_status = prompt.status
+        while time.time() - start < timeout:
+            try:
+                history_resp = self.http_client.get(
+                    f"{worker.base_url}/history/{prompt.prompt_id}", headers=headers
+                )
+                if history_resp.status_code == 404:
+                    time.sleep(0.05)
+                    continue
+                history_resp.raise_for_status()
+                history = history_resp.json().get("history", {}).get(prompt.prompt_id, {})
+                if history:
+                    self._apply_history(prompt, history)
+                    if history.get("status") in {"completed", "failed", "error"}:
+                        break
+                    last_status = history.get("status", last_status)
+            except Exception:
+                break
+            time.sleep(0.05)
+        prompt.status = prompt.status or last_status or "queued"
+        prompt.updated_at = datetime.utcnow()
+        self.session.add(prompt)
+        self.session.commit()
+        self.session.refresh(prompt)
+
+    def _apply_history(self, prompt: TaskPrompt, history: Dict[str, Any]) -> None:
+        status = history.get("status")
+        if status:
+            prompt.status = status
+        created_at = history.get("created_at")
+        started_at = history.get("started_at") or history.get("started")
+        completed_at = history.get("completed_at") or history.get("completed")
+        if created_at:
+            prompt.queued_at = datetime.fromtimestamp(created_at)
+        if started_at:
+            prompt.started_at = datetime.fromtimestamp(started_at)
+        if completed_at:
+            prompt.completed_at = datetime.fromtimestamp(completed_at)
+        prompt.updated_at = datetime.utcnow()
+        if "images" in history:
+            prompt.node_outputs["images"] = history.get("images")
+        if "outputs" in history:
+            prompt.node_outputs["outputs"] = history.get("outputs")
+        if history.get("error"):
+            prompt.node_outputs["error"] = history["error"]
