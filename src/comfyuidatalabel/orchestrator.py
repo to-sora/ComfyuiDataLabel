@@ -179,6 +179,9 @@ class SmartOrchestrator:
         batch_size = payload.get("batch_size", 1)
         if batch_size > workflow.max_workflow_batch_size:
             raise ValueError("Batch size exceeds workflow limit")
+        seeds_per_prompt = payload.get("seeds_per_prompt", 1)
+        if seeds_per_prompt > workflow.max_workflow_batch_size:
+            raise ValueError("Seeds per prompt exceeds workflow batch capacity")
 
         task = Task(**payload)
         task.updated_at = datetime.utcnow()
@@ -266,9 +269,9 @@ class SmartOrchestrator:
         if not healthy:
             raise RuntimeError("No healthy workers available to run prompts")
         worker = self.registry.select(candidates=healthy)
-        if not worker:
-            raise RuntimeError("All healthy workers are at capacity; try again later")
-        return worker
+        if worker:
+            return worker
+        return healthy[0]
 
     def _generate_prompts(self, task: Task) -> List[Dict[str, object]]:
         prompts: List[Dict[str, object]]
@@ -277,17 +280,21 @@ class SmartOrchestrator:
         else:
             raise ValueError("Provide a prompt_template or variable_input_mappings to generate prompts from pools")
         workflow = self._get_workflow(task.workflow_id)
-        seeds: List[int] = [random.randint(1, 2**31 - 1) for _ in range(task.seeds_per_prompt * len(prompts))]
-        return [
-            {
-                "prompt": prompt["prompt"],
-                "seed": seeds[idx],
-                "mode": "pilot" if idx < task.seeds_per_prompt else "mass",
-                "batch_size": min(task.batch_size, workflow.max_workflow_batch_size),
-                "applied_inputs": prompt.get("applied_inputs", {}),
-            }
-            for idx, prompt in enumerate(prompts * task.seeds_per_prompt)
-        ]
+        prompt_batch_size = min(task.batch_size, workflow.max_workflow_batch_size, task.seeds_per_prompt)
+        prompt_records: List[Dict[str, object]] = []
+        for prompt in prompts:
+            seed_list = [random.randint(1, 2**31 - 1) for _ in range(task.seeds_per_prompt)]
+            prompt_records.append(
+                {
+                    "prompt": prompt["prompt"],
+                    "seed": seed_list[0],
+                    "seed_list": seed_list,
+                    "mode": "mass",
+                    "batch_size": prompt_batch_size,
+                    "applied_inputs": prompt.get("applied_inputs", {}),
+                }
+            )
+        return prompt_records
 
     def _prompts_from_pool(self, task: Task) -> List[Dict[str, object]]:
         if not task.variable_pool_id:
@@ -343,10 +350,11 @@ class SmartOrchestrator:
         prompt.worker_endpoint = f"{worker.base_url}/prompt"
         prompt.client_id = prompt.client_id or prompt.task.client_id or f"client-{uuid4()}"
         workflow_graph = self._with_overrides(workflow.workflow_api, prompt.applied_inputs)
-        result, adjusted_graph, used_batch = self._submit_with_retries(
-            worker, prompt, workflow_graph
+        result, adjusted_graph, used_batch, used_seeds = self._submit_with_retries(
+            worker, prompt, workflow, workflow_graph
         )
         prompt.batch_size = used_batch
+        prompt.seed_list = used_seeds
         prompt.prompt_id = result.get("prompt_id") or prompt.prompt_id
         prompt.status = result.get("status", "queued")
         prompt.queued_at = datetime.utcnow()
@@ -446,24 +454,29 @@ class SmartOrchestrator:
         self,
         worker: Worker,
         prompt: TaskPrompt,
+        workflow: Workflow,
         workflow_graph: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Dict[str, Any], int]:
+    ) -> tuple[Dict[str, Any], Dict[str, Any], int, List[int]]:
         attempts = [
-            {"scale": 1.0, "batch_size": 1 if prompt.mode == "pilot" else prompt.batch_size},
-            {"scale": 0.75, "batch_size": 1 if prompt.mode == "pilot" else prompt.batch_size},
-            {"scale": 0.5, "batch_size": max(1, (1 if prompt.mode == "pilot" else prompt.batch_size) // 2)},
+            {"scale": 1.0, "batch_size": prompt.batch_size},
+            {"scale": 0.75, "batch_size": prompt.batch_size},
+            {"scale": 0.5, "batch_size": max(1, prompt.batch_size // 2)},
         ]
 
         last_error: Optional[Exception] = None
         headers = WorkerRegistry._headers(worker)
+        base_graph = workflow_graph
+        seeds = prompt.seed_list or [prompt.seed]
 
         for attempt in attempts:
-            scaled_graph = self._scale_resolution(workflow_graph, attempt["scale"])
-            payload = self._build_payload(prompt, scaled_graph, attempt["batch_size"])
+            attempt_batch = min(attempt["batch_size"], workflow.max_workflow_batch_size, len(seeds))
+            seeded_graph, seeds_used = self._apply_seed_batch(base_graph, seeds, workflow.seed_nodes, attempt_batch)
+            scaled_graph = self._scale_resolution(seeded_graph, attempt["scale"])
+            payload = self._build_payload(prompt, scaled_graph, attempt_batch, seeds_used)
             try:
                 response = self.http_client.post(prompt.worker_endpoint, json=payload, headers=headers)
                 response.raise_for_status()
-                return response.json(), scaled_graph, attempt["batch_size"]
+                return response.json(), scaled_graph, attempt_batch, seeds_used
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 if self._is_oom_response(exc.response):
@@ -476,16 +489,52 @@ class SmartOrchestrator:
         raise RuntimeError(f"Prompt submission failed after retries: {last_error}")
 
     def _build_payload(
-        self, prompt: TaskPrompt, workflow_graph: Dict[str, Any], batch_size: int
+        self, prompt: TaskPrompt, workflow_graph: Dict[str, Any], batch_size: int, seeds: List[int]
     ) -> Dict[str, Any]:
         prompt_payload = self._graph_keyed_by_node(workflow_graph)
-        return {
+        payload: Dict[str, Any] = {
             "prompt": prompt_payload,
             "client_id": prompt.client_id,
             "workflow_api": workflow_graph,
             "extra_data": prompt.task.extra_data or {},
             "batch_size": batch_size,
         }
+        if seeds:
+            payload["seed"] = seeds[0]
+            payload["seed_list"] = seeds
+        return payload
+
+    @staticmethod
+    def _apply_seed_batch(
+        workflow_api: Dict[str, Any], seeds: Sequence[int], seed_inputs: Sequence[str], batch_size: int
+    ) -> tuple[Dict[str, Any], List[int]]:
+        graph = copy.deepcopy(workflow_api) if workflow_api is not None else {}
+        seeds_to_use = list(seeds)[: batch_size or len(seeds)]
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        if isinstance(nodes, list):
+            node_iter = nodes
+        elif isinstance(nodes, dict):
+            node_iter = nodes.values()
+        else:
+            return graph, seeds_to_use
+
+        seed_keys = set(str(key) for key in (seed_inputs or ["seed"]))
+
+        for node in node_iter:
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+            if node.get("class_type") == "LatentBatchSeedBehavior" and seeds_to_use:
+                inputs["seed_behavior"] = inputs.get("seed_behavior") or "fixed"
+                inputs["seed_list"] = seeds_to_use
+            if batch_size:
+                if "batch_size" in inputs:
+                    inputs["batch_size"] = batch_size
+            for key in seed_keys:
+                if key in inputs and seeds_to_use:
+                    inputs[key] = seeds_to_use[0]
+            node["inputs"] = inputs
+        return graph, seeds_to_use
 
     @staticmethod
     def _scale_resolution(workflow_api: Dict[str, Any], scale: float) -> Dict[str, Any]:
