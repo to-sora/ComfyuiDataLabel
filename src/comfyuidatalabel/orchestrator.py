@@ -196,9 +196,7 @@ class SmartOrchestrator:
             raise RuntimeError("Pilot can only run from draft state")
         worker = self._select_worker_or_raise()
         self.registry.record_job(worker)
-        pilot_batch = [p for p in task.prompts if p.mode == "pilot"]
-        if not pilot_batch:
-            pilot_batch = task.prompts[: min(2, len(task.prompts))]
+        pilot_batch = self._pilot_batch(workflow, task.prompts)
         jobs = [self._simulate_comfy_call(worker, workflow, p) for p in pilot_batch]
         task.status = "pilot_passed"
         task.updated_at = datetime.utcnow()
@@ -345,21 +343,10 @@ class SmartOrchestrator:
         prompt.worker_endpoint = f"{worker.base_url}/prompt"
         prompt.client_id = prompt.client_id or prompt.task.client_id or f"client-{uuid4()}"
         workflow_graph = self._with_overrides(workflow.workflow_api, prompt.applied_inputs)
-        prompt_payload = self._graph_keyed_by_node(workflow_graph)
-        payload: Dict[str, Any] = {
-            "prompt": prompt_payload,
-            "client_id": prompt.client_id,
-            "workflow_api": workflow_graph,
-            "extra_data": prompt.task.extra_data or {},
-        }
-
-        response = self.http_client.post(
-            prompt.worker_endpoint,
-            json=payload,
-            headers=WorkerRegistry._headers(worker),
+        result, adjusted_graph, used_batch = self._submit_with_retries(
+            worker, prompt, workflow_graph
         )
-        response.raise_for_status()
-        result = response.json()
+        prompt.batch_size = used_batch
         prompt.prompt_id = result.get("prompt_id") or prompt.prompt_id
         prompt.status = result.get("status", "queued")
         prompt.queued_at = datetime.utcnow()
@@ -382,7 +369,160 @@ class SmartOrchestrator:
             "prompt_id": prompt.prompt_id or "",
             "client_id": prompt.client_id or "",
             "status": prompt.status,
+            "workflow_resolution": str(self._max_resolution(adjusted_graph)),
         }
+
+    def _pilot_batch(self, workflow: Workflow, prompts: Sequence[TaskPrompt]) -> List[TaskPrompt]:
+        if not prompts:
+            return []
+
+        def _cost_entry(prompt: TaskPrompt) -> tuple[int, Dict[str, int]]:
+            score, details = self._prompt_cost(workflow, prompt)
+            return score, details
+
+        scored = [(_cost_entry(p), p) for p in prompts]
+        scored.sort(key=lambda entry: entry[0][0], reverse=True)
+        top_prompt = scored[0][1]
+        if top_prompt.mode != "pilot":
+            top_prompt.mode = "pilot"
+            self.session.add(top_prompt)
+            self.session.commit()
+        return [top_prompt]
+
+    def _prompt_cost(self, workflow: Workflow, prompt: TaskPrompt) -> tuple[int, Dict[str, int]]:
+        graph = self._with_overrides(workflow.workflow_api, prompt.applied_inputs)
+        resolution = self._max_resolution(graph)
+        controlnets = self._controlnet_count(graph)
+        score = resolution * max(controlnets, 1)
+        return score, {"resolution": resolution, "controlnets": controlnets}
+
+    @staticmethod
+    def _max_resolution(workflow_api: Dict[str, Any]) -> int:
+        nodes = workflow_api.get("nodes") if isinstance(workflow_api, dict) else None
+        if isinstance(nodes, list):
+            node_iter = nodes
+        elif isinstance(nodes, dict):
+            node_iter = nodes.values()
+        else:
+            return 0
+
+        max_res = 0
+
+        def _to_int(value: Any) -> Optional[int]:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        for node in node_iter:
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+            width = _to_int(inputs.get("width") or inputs.get("Width"))
+            height = _to_int(inputs.get("height") or inputs.get("Height"))
+            if width and height:
+                max_res = max(max_res, width * height)
+        return max_res
+
+    @staticmethod
+    def _controlnet_count(workflow_api: Dict[str, Any]) -> int:
+        nodes = workflow_api.get("nodes") if isinstance(workflow_api, dict) else None
+        if isinstance(nodes, list):
+            node_iter = nodes
+        elif isinstance(nodes, dict):
+            node_iter = nodes.values()
+        else:
+            return 0
+        count = 0
+        for node in node_iter:
+            if not isinstance(node, dict):
+                continue
+            class_type = str(node.get("class_type") or "").lower()
+            if "controlnet" in class_type:
+                count += 1
+        return count
+
+    def _submit_with_retries(
+        self,
+        worker: Worker,
+        prompt: TaskPrompt,
+        workflow_graph: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any], int]:
+        attempts = [
+            {"scale": 1.0, "batch_size": 1 if prompt.mode == "pilot" else prompt.batch_size},
+            {"scale": 0.75, "batch_size": 1 if prompt.mode == "pilot" else prompt.batch_size},
+            {"scale": 0.5, "batch_size": max(1, (1 if prompt.mode == "pilot" else prompt.batch_size) // 2)},
+        ]
+
+        last_error: Optional[Exception] = None
+        headers = WorkerRegistry._headers(worker)
+
+        for attempt in attempts:
+            scaled_graph = self._scale_resolution(workflow_graph, attempt["scale"])
+            payload = self._build_payload(prompt, scaled_graph, attempt["batch_size"])
+            try:
+                response = self.http_client.post(prompt.worker_endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.json(), scaled_graph, attempt["batch_size"]
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if self._is_oom_response(exc.response):
+                    continue
+                raise
+            except Exception as exc:  # pragma: no cover - network or unexpected errors
+                last_error = exc
+                break
+
+        raise RuntimeError(f"Prompt submission failed after retries: {last_error}")
+
+    def _build_payload(
+        self, prompt: TaskPrompt, workflow_graph: Dict[str, Any], batch_size: int
+    ) -> Dict[str, Any]:
+        prompt_payload = self._graph_keyed_by_node(workflow_graph)
+        return {
+            "prompt": prompt_payload,
+            "client_id": prompt.client_id,
+            "workflow_api": workflow_graph,
+            "extra_data": prompt.task.extra_data or {},
+            "batch_size": batch_size,
+        }
+
+    @staticmethod
+    def _scale_resolution(workflow_api: Dict[str, Any], scale: float) -> Dict[str, Any]:
+        if scale == 1.0:
+            return copy.deepcopy(workflow_api)
+        scaled = copy.deepcopy(workflow_api) if workflow_api is not None else {}
+        nodes = scaled.get("nodes") if isinstance(scaled, dict) else None
+        if isinstance(nodes, list):
+            node_iter = nodes
+        elif isinstance(nodes, dict):
+            node_iter = nodes.values()
+        else:
+            return scaled
+
+        for node in node_iter:
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+
+            def _scale_value(value: Any) -> Any:
+                try:
+                    return max(1, int(int(value) * scale))
+                except (TypeError, ValueError):
+                    return value
+
+            for key in ("width", "Width", "height", "Height"):
+                if key in inputs:
+                    inputs[key] = _scale_value(inputs[key])
+            node["inputs"] = inputs
+        return scaled
+
+    @staticmethod
+    def _is_oom_response(response: httpx.Response | None) -> bool:
+        if response is None:
+            return False
+        text = "" if response.text is None else response.text
+        return "out of memory" in text.lower()
 
     @staticmethod
     def _with_overrides(workflow_api: Dict[str, Any], overrides: Dict[str, Dict[str, object]]) -> Dict[str, object]:
