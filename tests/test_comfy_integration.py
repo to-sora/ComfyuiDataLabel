@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlmodel import Session, SQLModel
+import os
 from uuid import uuid4
+
+import pytest
+from sqlmodel import Session, SQLModel
 
 from comfyuidatalabel.database import get_engine, init_db
 from comfyuidatalabel.orchestrator import SmartOrchestrator

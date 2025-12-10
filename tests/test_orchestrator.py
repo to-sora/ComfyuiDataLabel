@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 
 import pytest
 from sqlmodel import Session, SQLModel
-from uuid import uuid4
 
 CURRENT_DB = None
 
