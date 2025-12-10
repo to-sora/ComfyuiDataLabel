@@ -68,7 +68,10 @@ class WorkerCreate(BaseModel):
 class TaskCreate(BaseModel):
     workflow_id: str
     variable_pool_id: str
-    prompt_template: str
+    prompt_template: Optional[str] = None
+    variable_input_mappings: List[Dict[str, str]] = Field(default_factory=list)
+    client_id: Optional[str] = None
+    extra_data: Dict[str, object] = Field(default_factory=dict)
     batch_size: int = Field(gt=0)
     seeds_per_prompt: int = Field(default=1, gt=0)
     target_prompts: int = Field(default=1, gt=0)

@@ -56,6 +56,9 @@ class Task(SQLModel, table=True):
     seeds_per_prompt: int = Field(default=1, gt=0)
     target_prompts: int = Field(default=1, gt=0)
     prompt_template: Optional[str] = None
+    variable_input_mappings: List[Dict[str, str]] = Field(default_factory=list, sa_column=Column(JSON))
+    client_id: Optional[str] = None
+    extra_data: Dict[str, object] = Field(default_factory=dict, sa_column=Column(JSON))
     status: str = Field(default="draft")  # draft -> pilot_passed -> frozen -> generating -> completed
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
     updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
@@ -74,6 +77,7 @@ class TaskPrompt(SQLModel, table=True):
     worker_endpoint: Optional[str] = None
     batch_size: int = Field(default=1, gt=0)
     status: str = Field(default="queued")
+    applied_inputs: Dict[str, Dict[str, object]] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
     task: Task = Relationship(back_populates="prompts")

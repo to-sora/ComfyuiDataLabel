@@ -17,10 +17,14 @@
         .list { list-style: none; padding: 0; margin: 0; }
         .list li { padding: 0.35rem 0; border-bottom: 1px solid #1f2937; }
         .muted { color: #94a3b8; font-size: 0.85rem; }
+        .row { display: flex; gap: 0.5rem; align-items: center; }
+        .row input { flex: 1; }
+        .error { color: #f87171; margin-top: 0.5rem; }
     </style>
 </head>
 <body>
     <h1>Human-in-the-loop Data Curation</h1>
+    <div id="status" class="error"></div>
     <div class="grid">
         <div class="card">
             <h2>Register Workflow</h2>
@@ -32,6 +36,10 @@
             <input id="wf-prompt" />
             <label>Seed Nodes (comma separated)</label>
             <input id="wf-seed" />
+            <label>Workflow Graph JSON</label>
+            <textarea id="wf-graph" rows="6" placeholder='{"nodes":[],"links":[]}'></textarea>
+            <label>Upload workflow JSON</label>
+            <input id="wf-upload" type="file" accept="application/json" />
             <button onclick="createWorkflow()">Save Workflow</button>
             <p class="muted">Existing: {{ workflows|length }}</p>
         </div>
@@ -70,10 +78,19 @@
             {% endfor %}
         </select>
         <label>Prompt Template</label>
-        <input id="task-template" placeholder="a {style} portrait with {lighting} lighting" />
+        <input id="task-template" placeholder="Optional when using node input mappings" />
+        <div>
+            <label>Variable → Node Input Mappings</label>
+            <div id="variable-mappings"></div>
+            <button type="button" onclick="addMappingRow()">Add Mapping</button>
+            <p class="muted">Map pool variables to workflow node inputs (node id & input name).</p>
+        </div>
         <label>Target Prompts</label><input id="task-target" type="number" value="2" />
         <label>Seeds per Prompt</label><input id="task-seeds" type="number" value="2" />
         <label>Batch Size</label><input id="task-batch" type="number" value="2" />
+        <label>Client ID</label><input id="task-client" placeholder="Optional client id" />
+        <label>Extra Data (JSON)</label>
+        <textarea id="task-extra" rows="3" placeholder='{"api_key":"..."}'></textarea>
         <button onclick="createTask()">Create Task</button>
     </div>
 
@@ -91,16 +108,65 @@
     </div>
 
 <script>
+function setStatus(message) {
+    const el = document.getElementById('status');
+    el.textContent = message || '';
+}
+
+document.getElementById('wf-upload').addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+        const text = await file.text();
+        JSON.parse(text);
+        document.getElementById('wf-graph').value = text;
+        setStatus('Loaded workflow JSON from file.');
+    } catch (err) {
+        setStatus('Invalid workflow JSON file.');
+    }
+});
+
+function parseJsonInput(elementId, label) {
+    const raw = document.getElementById(elementId).value.trim();
+    if (!raw) return {};
+    try {
+        return JSON.parse(raw);
+    } catch (err) {
+        throw new Error(`${label} contains invalid JSON.`);
+    }
+}
+
+function addMappingRow(initial = {}) {
+    const container = document.getElementById('variable-mappings');
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `
+        <input placeholder="Variable key" value="${initial.variable || ''}" />
+        <input placeholder="Node ID" value="${initial.node_id || ''}" />
+        <input placeholder="Input name" value="${initial.input_name || ''}" />
+        <button type="button">✕</button>
+    `;
+    row.querySelector('button').onclick = () => container.removeChild(row);
+    container.appendChild(row);
+}
+
+addMappingRow();
+
 async function createWorkflow() {
-    const payload = {
-        name: document.getElementById('wf-name').value,
-        max_workflow_batch_size: Number(document.getElementById('wf-batch').value),
-        prompt_nodes: document.getElementById('wf-prompt').value.split(',').filter(Boolean),
-        seed_nodes: document.getElementById('wf-seed').value.split(',').filter(Boolean),
-        workflow_api: {}
-    };
-    await fetch('/admin/workflows', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-    location.reload();
+    try {
+        const workflowApi = parseJsonInput('wf-graph', 'Workflow graph');
+        const payload = {
+            name: document.getElementById('wf-name').value,
+            max_workflow_batch_size: Number(document.getElementById('wf-batch').value),
+            prompt_nodes: document.getElementById('wf-prompt').value.split(',').filter(Boolean),
+            seed_nodes: document.getElementById('wf-seed').value.split(',').filter(Boolean),
+            workflow_api: workflowApi,
+        };
+        await fetch('/admin/workflows', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        location.reload();
+    } catch (err) {
+        setStatus(err.message);
+    }
 }
 async function createVariablePool() {
     const payload = {
@@ -125,16 +191,32 @@ async function registerWorker() {
     location.reload();
 }
 async function createTask() {
-    const payload = {
-        workflow_id: document.getElementById('task-workflow').value,
-        variable_pool_id: document.getElementById('task-pool').value,
-        prompt_template: document.getElementById('task-template').value,
-        batch_size: Number(document.getElementById('task-batch').value),
-        seeds_per_prompt: Number(document.getElementById('task-seeds').value),
-        target_prompts: Number(document.getElementById('task-target').value)
-    };
-    await fetch('/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-    location.reload();
+    try {
+        const extraData = parseJsonInput('task-extra', 'Extra data');
+        const mappings = Array.from(document.getElementById('variable-mappings').children).map(row => {
+            const [variableEl, nodeEl, inputEl] = row.querySelectorAll('input');
+            return {
+                variable: variableEl.value.trim(),
+                node_id: nodeEl.value.trim(),
+                input_name: inputEl.value.trim()
+            };
+        }).filter(m => m.variable && m.node_id && m.input_name);
+        const payload = {
+            workflow_id: document.getElementById('task-workflow').value,
+            variable_pool_id: document.getElementById('task-pool').value,
+            prompt_template: document.getElementById('task-template').value,
+            variable_input_mappings: mappings,
+            batch_size: Number(document.getElementById('task-batch').value),
+            seeds_per_prompt: Number(document.getElementById('task-seeds').value),
+            target_prompts: Number(document.getElementById('task-target').value),
+            client_id: document.getElementById('task-client').value || null,
+            extra_data: extraData
+        };
+        await fetch('/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        location.reload();
+    } catch (err) {
+        setStatus(err.message);
+    }
 }
 </script>
 </body>
