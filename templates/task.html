@@ -10,6 +10,13 @@
         button { padding: 0.6rem 1rem; border: none; border-radius: 10px; background: #22d3ee; color: #0b1220; font-weight: bold; margin-right: 0.5rem; }
         .prompt { padding: 0.75rem; background: #0b1220; border-radius: 8px; margin-bottom: 0.5rem; }
         .annotation button { margin-top: 0.25rem; width: 100%; }
+        .annotation select, .annotation input[type="checkbox"] { width: 100%; padding: 0.5rem; margin-top: 0.25rem; border-radius: 8px; border: 1px solid #1f2937; background: #0f172a; color: #e2e8f0; }
+        .annotation label { display: block; margin-top: 0.5rem; font-size: 0.9rem; color: #cbd5e1; }
+        .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.5rem; }
+        @media (max-width: 640px) {
+            body { padding: 0.75rem; }
+            .card { padding: 0.85rem; }
+        }
         .muted { color: #94a3b8; font-size: 0.85rem; }
     </style>
 </head>
@@ -31,9 +38,29 @@
             <div>{{ prompt.prompt }}</div>
             <div class="muted">seed: {{ prompt.seed }} | mode: {{ prompt.mode }}</div>
             <div class="annotation">
-                <button onclick="annotate('{{ prompt.id }}','A')">A - Prefer</button>
-                <button onclick="annotate('{{ prompt.id }}','B')">B - Alternative</button>
-                <button onclick="annotate('{{ prompt.id }}','N')">N - Reject</button>
+                <label for="chosen-{{ prompt.id }}">Chosen index</label>
+                <select id="chosen-{{ prompt.id }}">
+                    <option value="">Select one</option>
+                    {% set total = prompt.seed_list|length if prompt.seed_list else 1 %}
+                    {% for idx in range(total) %}
+                    <option value="{{ idx }}">{{ idx }}</option>
+                    {% endfor %}
+                </select>
+
+                <label for="rejected-{{ prompt.id }}">Rejected index (optional)</label>
+                <select id="rejected-{{ prompt.id }}">
+                    <option value="">None</option>
+                    {% for idx in range(total) %}
+                    <option value="{{ idx }}">{{ idx }}</option>
+                    {% endfor %}
+                </select>
+
+                <label><input type="checkbox" id="spam-{{ prompt.id }}" /> Mark as spam</label>
+
+                <div class="actions">
+                    <button onclick="annotate('{{ prompt.id }}')">Save Annotation</button>
+                    <button style="background:#0ea5e9;color:#0b1220" onclick="markSpamOnly('{{ prompt.id }}')">Spam Only</button>
+                </div>
             </div>
         </div>
         {% endfor %}
@@ -43,9 +70,28 @@
 async function pilot(){ await fetch(`/tasks/{{ task.id }}/pilot`, {method:'POST'}); location.reload(); }
 async function freezeTask(){ await fetch(`/tasks/{{ task.id }}/freeze`, {method:'POST'}); location.reload(); }
 async function generate(){ await fetch(`/tasks/{{ task.id }}/generate`, {method:'POST'}); location.reload(); }
-async function annotate(promptId, choice){
-    await fetch(`/prompts/${promptId}/annotations`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({choice})});
+function buildAnnotationPayload(promptId, spamOnly=false){
+    const spamToggle = document.getElementById(`spam-${promptId}`);
+    if(spamToggle){ spamToggle.checked = spamOnly || spamToggle.checked; }
+    const chosen = document.getElementById(`chosen-${promptId}`)?.value;
+    const rejected = document.getElementById(`rejected-${promptId}`)?.value;
+    return {
+        chosen_index: chosen === '' ? null : Number(chosen),
+        rejected_index: rejected === '' ? null : Number(rejected),
+        spam: document.getElementById(`spam-${promptId}`)?.checked || false,
+    };
+}
+
+async function annotate(promptId){
+    const payload = buildAnnotationPayload(promptId);
+    await fetch(`/prompts/${promptId}/annotations`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     alert('Saved annotation for '+promptId);
+}
+
+async function markSpamOnly(promptId){
+    const payload = buildAnnotationPayload(promptId, true);
+    await fetch(`/prompts/${promptId}/annotations`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    alert('Saved spam annotation for '+promptId);
 }
 </script>
 </body>

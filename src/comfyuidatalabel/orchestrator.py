@@ -239,7 +239,10 @@ class SmartOrchestrator:
 
     def annotate(self, task_prompt_id: str, payload: Dict[str, object]) -> Annotation:
         prompt = self._get_prompt(task_prompt_id)
-        annotation = Annotation(task_prompt_id=prompt.id, **payload)
+        from .main import AnnotationCreate  # local import to avoid cycle
+
+        validated = AnnotationCreate.model_validate(payload).model_dump()
+        annotation = Annotation(task_prompt_id=prompt.id, **validated)
         self.session.add(annotation)
         self.session.commit()
         self.session.refresh(annotation)

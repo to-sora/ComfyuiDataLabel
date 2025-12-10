@@ -97,6 +97,6 @@ def test_end_to_end_api_flow():
     prompts = client.get(f"/tasks/{task['id']}/prompts").json()
     ann = client.post(
         f"/prompts/{prompts[0]['id']}/annotations",
-        json={"choice": "A", "comment": "good"},
+        json={"chosen_index": 0, "rejected_index": None, "spam": False, "comment": "good"},
     )
     assert ann.status_code == 200

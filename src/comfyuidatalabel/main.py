@@ -7,7 +7,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlmodel import Session, select
 
 from .database import get_engine, init_db
@@ -78,8 +78,22 @@ class TaskCreate(BaseModel):
 
 
 class AnnotationCreate(BaseModel):
-    choice: str
+    chosen_index: Optional[int] = Field(default=None, ge=0)
+    rejected_index: Optional[int] = Field(default=None, ge=0)
+    spam: bool = False
     comment: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_annotation(self):  # type: ignore[override]
+        if not self.spam and self.chosen_index is None:
+            raise ValueError("chosen_index is required unless marked as spam")
+        if (
+            self.chosen_index is not None
+            and self.rejected_index is not None
+            and self.chosen_index == self.rejected_index
+        ):
+            raise ValueError("rejected_index cannot be the same as chosen_index")
+        return self
 
 
 # Admin endpoints
