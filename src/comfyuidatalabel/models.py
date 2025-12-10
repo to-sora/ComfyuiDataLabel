@@ -16,6 +16,7 @@ class Workflow(SQLModel, table=True):
     allow_dynamic_resolution: bool = False
     workflow_api: Dict[str, object] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
     tasks: list["Task"] = Relationship(back_populates="workflow")
 
@@ -73,12 +74,19 @@ class TaskPrompt(SQLModel, table=True):
     task_id: str = Field(foreign_key="task.id")
     prompt: str
     seed: int
+    prompt_id: Optional[str] = None
+    client_id: Optional[str] = None
     mode: str = Field(default="pilot")  # pilot | mass
     worker_endpoint: Optional[str] = None
     batch_size: int = Field(default=1, gt=0)
     status: str = Field(default="queued")
+    node_outputs: Dict[str, object] = Field(default_factory=dict, sa_column=Column(JSON))
     applied_inputs: Dict[str, Dict[str, object]] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    queued_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
     task: Task = Relationship(back_populates="prompts")
     annotations: list["Annotation"] = Relationship(back_populates="task_prompt")
