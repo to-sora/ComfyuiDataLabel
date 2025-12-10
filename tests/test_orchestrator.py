@@ -82,8 +82,12 @@ def test_task_lifecycle_with_variable_pool():
         mass_jobs = orchestrator.generate(task.id)
         assert len(mass_jobs) == len(task.prompts) - len(pilot_jobs)
         first_prompt = session.get(TaskPrompt, task.prompts[0].id)
-        ann = orchestrator.annotate(first_prompt.id, {"choice": "A", "comment": "Great"})
-        assert ann.choice == "A"
+        ann = orchestrator.annotate(
+            first_prompt.id,
+            {"chosen_index": 0, "rejected_index": None, "spam": False, "comment": "Great"},
+        )
+        assert ann.chosen_index == 0
+        assert ann.spam is False
 
 
 def test_variable_pool_insufficient_combinations():

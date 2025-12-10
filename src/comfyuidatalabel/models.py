@@ -98,7 +98,9 @@ class TaskPrompt(SQLModel, table=True):
 class Annotation(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
     task_prompt_id: str = Field(foreign_key="taskprompt.id")
-    choice: str
+    chosen_index: int = Field(ge=0)
+    rejected_index: Optional[int] = Field(default=None, ge=0)
+    spam: bool = Field(default=False)
     comment: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
