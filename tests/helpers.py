@@ -4,9 +4,12 @@ import httpx
 from fastapi.testclient import TestClient
 
 from comfyuidatalabel.comfy_server import app as comfy_app
+from comfyuidatalabel.comfy_server import stub
 
 
-def comfy_stub_client() -> httpx.Client:
+def comfy_stub_client(api_key: str | None = None) -> httpx.Client:
+    stub.reset()
+    stub.api_key = api_key
     client = TestClient(comfy_app)
 
     def _handler(request: httpx.Request) -> httpx.Response:
