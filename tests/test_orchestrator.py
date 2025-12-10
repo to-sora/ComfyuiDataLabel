@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlmodel import Session, SQLModel
 
@@ -223,6 +224,150 @@ def test_waits_for_worker_capacity_before_submitting():
         assert pilot_jobs
         refreshed_worker = session.get(type(worker), worker.id)
         assert refreshed_worker.queue_length >= 0
+
+
+def test_pilot_prefers_high_cost_prompt_and_forces_batch(monkeypatch):
+    engine = get_engine()
+    http_client = comfy_stub_client()
+    with Session(engine) as session:
+        orchestrator = SmartOrchestrator(session, http_client=http_client)
+        workflow = orchestrator.add_workflow(
+            {
+                "name": "costly",
+                "prompt_nodes": ["k_sampler"],
+                "seed_nodes": ["seed"],
+                "max_workflow_batch_size": 4,
+                "workflow_api": {
+                    "nodes": [
+                        {"id": 1, "class_type": "KSampler", "inputs": {"width": 512, "height": 512}},
+                        {"id": 2, "class_type": "ControlNetApply", "inputs": {"enabled": True}},
+                    ]
+                },
+            }
+        )
+        pool = orchestrator.add_variable_pool(
+            {
+                "name": "resolutions",
+                "version": "v1",
+                "sampling_mode": "no_replacement",
+                "variables": {
+                    "width": [512, 1024],
+                    "height": [512, 1024],
+                    "control": [False, True],
+                },
+            }
+        )
+        worker = orchestrator.register_worker(
+            {
+                "name": "gpu-control",
+                "base_url": "http://comfy-stub",
+                "enabled": True,
+                "max_concurrent_jobs": 1,
+            },
+            check=False,
+        )
+        worker.status = "HEALTHY"
+        session.add(worker)
+        session.commit()
+
+        task = orchestrator.create_task(
+            {
+                "workflow_id": workflow.id,
+                "variable_pool_id": pool.id,
+                "prompt_template": "image",
+                "batch_size": 3,
+                "seeds_per_prompt": 1,
+                "target_prompts": 2,
+                "variable_input_mappings": [
+                    {"variable": "width", "node_id": 1, "input_name": "width"},
+                    {"variable": "height", "node_id": 1, "input_name": "height"},
+                    {"variable": "control", "node_id": 2, "input_name": "enabled"},
+                ],
+            }
+        )
+
+        pilot_jobs = orchestrator.run_pilot(task.id)
+        assert len(pilot_jobs) == 1
+        pilot_prompt = next(p for p in task.prompts if p.mode == "pilot")
+        assert pilot_prompt.batch_size == 1
+        assert pilot_prompt.applied_inputs["1"]["width"] == 1024
+        assert pilot_prompt.applied_inputs["1"]["height"] == 1024
+        assert pilot_prompt.applied_inputs["2"]["enabled"] is True
+        assert pilot_jobs[0]["batch_size"] == "1"
+
+
+def test_retries_reduce_resolution_on_oom(monkeypatch):
+    engine = get_engine()
+
+    class OOMClient:
+        def __init__(self):
+            self.payloads = []
+            self.attempts = 0
+
+        def post(self, url, json=None, headers=None):
+            self.payloads.append(json)
+            self.attempts += 1
+            request = httpx.Request("POST", url)
+            if self.attempts < 3:
+                response = httpx.Response(500, request=request, text="CUDA out of memory")
+                raise httpx.HTTPStatusError("OOM", request=request, response=response)
+            return httpx.Response(200, request=request, json={"prompt_id": "p-final", "status": "queued"})
+
+        def get(self, url, headers=None):
+            request = httpx.Request("GET", url)
+            return httpx.Response(404, request=request)
+
+    http_client = OOMClient()
+
+    with Session(engine) as session:
+        orchestrator = SmartOrchestrator(session, http_client=http_client)
+        workflow = orchestrator.add_workflow(
+            {
+                "name": "oomy",
+                "prompt_nodes": ["k_sampler"],
+                "seed_nodes": ["seed"],
+                "max_workflow_batch_size": 4,
+                "workflow_api": {"nodes": [{"id": 1, "class_type": "KSampler", "inputs": {"width": 1024, "height": 1024}}]},
+            }
+        )
+        pool = orchestrator.add_variable_pool(
+            {
+                "name": "simple",
+                "version": "v1",
+                "variables": {"style": ["flat"]},
+            }
+        )
+        worker = orchestrator.register_worker(
+            {
+                "name": "gpu-oom",
+                "base_url": "http://comfy-stub",
+                "enabled": True,
+                "max_concurrent_jobs": 1,
+            },
+            check=False,
+        )
+        worker.status = "HEALTHY"
+        session.add(worker)
+        session.commit()
+
+        orchestrator.registry.sync_queue_length = lambda worker: (0, 0, 0)
+
+        task = orchestrator.create_task(
+            {
+                "workflow_id": workflow.id,
+                "variable_pool_id": pool.id,
+                "prompt_template": "{style}",
+                "batch_size": 2,
+                "seeds_per_prompt": 1,
+                "target_prompts": 1,
+            }
+        )
+
+        pilot_jobs = orchestrator.run_pilot(task.id)
+        assert pilot_jobs[0]["prompt_id"] == "p-final"
+        widths = [payload["prompt"]["1"]["inputs"]["width"] for payload in http_client.payloads]
+        assert widths[0] > widths[-1]
+        assert len(http_client.payloads) == 3
 
 
 def test_worker_selection_respects_priority_and_queue_length(monkeypatch):
