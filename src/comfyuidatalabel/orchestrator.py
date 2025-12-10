@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import itertools
+import json
 import random
 import time
 from datetime import datetime
@@ -189,24 +191,25 @@ class SmartOrchestrator:
         return worker
 
     def _generate_prompts(self, task: Task) -> List[Dict[str, object]]:
-        prompts: List[str]
-        if task.prompt_template:
+        prompts: List[Dict[str, object]]
+        if task.prompt_template or task.variable_input_mappings:
             prompts = self._prompts_from_pool(task)
         else:
-            raise ValueError("prompt_template is required to generate prompts from pools")
+            raise ValueError("Provide a prompt_template or variable_input_mappings to generate prompts from pools")
         workflow = self._get_workflow(task.workflow_id)
         seeds: List[int] = [random.randint(1, 2**31 - 1) for _ in range(task.seeds_per_prompt * len(prompts))]
         return [
             {
-                "prompt": prompt,
+                "prompt": prompt["prompt"],
                 "seed": seeds[idx],
                 "mode": "pilot" if idx < task.seeds_per_prompt else "mass",
                 "batch_size": min(task.batch_size, workflow.max_workflow_batch_size),
+                "applied_inputs": prompt.get("applied_inputs", {}),
             }
             for idx, prompt in enumerate(prompts * task.seeds_per_prompt)
         ]
 
-    def _prompts_from_pool(self, task: Task) -> List[str]:
+    def _prompts_from_pool(self, task: Task) -> List[Dict[str, object]]:
         if not task.variable_pool_id:
             raise ValueError("Variable pool is required when using prompt templates")
         pool = self.session.get(VariablePool, task.variable_pool_id)
@@ -218,10 +221,30 @@ class SmartOrchestrator:
             combos = itertools.product(*[variables[slot] for slot in slots])
         else:
             combos = zip(*[variables[slot] for slot in slots])
-        prompts: List[str] = []
+        prompts: List[Dict[str, object]] = []
         for combo in combos:
             prompt_vars = dict(zip(slots, combo))
-            prompts.append(task.prompt_template.format(**prompt_vars))
+            applied_inputs: Dict[str, Dict[str, object]] = {}
+            for mapping in task.variable_input_mappings:
+                variable_name = mapping.get("variable")
+                node_id = mapping.get("node_id")
+                input_name = mapping.get("input_name")
+                if not variable_name or variable_name not in prompt_vars:
+                    continue
+                if not node_id or not input_name:
+                    continue
+                node_inputs = applied_inputs.setdefault(str(node_id), {})
+                node_inputs[input_name] = prompt_vars[variable_name]
+
+            prompt_text: str
+            if task.prompt_template:
+                prompt_text = task.prompt_template.format(**prompt_vars)
+            elif applied_inputs:
+                prompt_text = f"Node inputs: {json.dumps(applied_inputs)}"
+            else:
+                prompt_text = ""
+
+            prompts.append({"prompt": prompt_text, "applied_inputs": applied_inputs})
             if len(prompts) >= task.target_prompts:
                 break
         if len(prompts) < task.target_prompts:
@@ -238,11 +261,15 @@ class SmartOrchestrator:
     def _simulate_comfy_call(self, worker: Worker, workflow: Workflow, prompt: TaskPrompt) -> Dict[str, str]:
         prompt.worker_endpoint = f"{worker.base_url}/prompt"
         payload = {
-            "workflow_api": workflow.workflow_api,
+            "workflow_api": self._with_overrides(workflow.workflow_api, prompt.applied_inputs),
             "prompt": prompt.prompt,
             "seed": prompt.seed,
             "batch_size": prompt.batch_size,
         }
+        if prompt.task.client_id:
+            payload["client_id"] = prompt.task.client_id
+        if prompt.task.extra_data:
+            payload["extra_data"] = prompt.task.extra_data
         response = self.http_client.post(prompt.worker_endpoint, json=payload)
         response.raise_for_status()
         prompt.status = "queued"
@@ -259,3 +286,25 @@ class SmartOrchestrator:
             "endpoint": prompt.worker_endpoint,
             "prompt_id": result.get("prompt_id", ""),
         }
+
+    @staticmethod
+    def _with_overrides(workflow_api: Dict[str, object], overrides: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+        if not overrides:
+            return workflow_api
+        workflow = copy.deepcopy(workflow_api)
+        nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
+        if isinstance(nodes, list):
+            node_map = {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
+        elif isinstance(nodes, dict):
+            node_map = {str(node_id): node for node_id, node in nodes.items() if isinstance(node, dict)}
+        else:
+            node_map = {}
+
+        for node_id, inputs in overrides.items():
+            node = node_map.get(str(node_id))
+            if not node:
+                continue
+            current_inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+            current_inputs.update(inputs)
+            node["inputs"] = current_inputs
+        return workflow
