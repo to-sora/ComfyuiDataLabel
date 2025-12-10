@@ -296,6 +296,84 @@ def test_pilot_prefers_high_cost_prompt_and_forces_batch(monkeypatch):
         assert pilot_jobs[0]["batch_size"] == "1"
 
 
+def test_seed_lists_are_grouped_into_single_batch_submission():
+    engine = get_engine()
+
+    class CaptureClient:
+        def __init__(self):
+            self.payloads = []
+
+        def post(self, url, json=None, headers=None):
+            self.payloads.append(json)
+            request = httpx.Request("POST", url)
+            return httpx.Response(200, request=request, json={"prompt_id": "seeded-1", "status": "queued"})
+
+        def get(self, url, headers=None):
+            request = httpx.Request("GET", url)
+            return httpx.Response(200, request=request, json={"queue_pending": [], "queue_running": []})
+
+    http_client = CaptureClient()
+
+    with Session(engine) as session:
+        orchestrator = SmartOrchestrator(session, http_client=http_client)
+        workflow = orchestrator.add_workflow(
+            {
+                "name": "seeded",
+                "prompt_nodes": ["k_sampler"],
+                "seed_nodes": ["seed"],
+                "max_workflow_batch_size": 4,
+                "workflow_api": {
+                    "nodes": [
+                        {"id": 1, "class_type": "KSampler", "inputs": {"seed": 0, "batch_size": 1}},
+                        {"id": 2, "class_type": "LatentBatchSeedBehavior", "inputs": {}},
+                    ]
+                },
+            }
+        )
+        pool = orchestrator.add_variable_pool(
+            {
+                "name": "seed-pool",
+                "version": "v1",
+                "variables": {"style": ["soft"]},
+            }
+        )
+        worker = orchestrator.register_worker(
+            {
+                "name": "gpu-seeds",
+                "base_url": "http://comfy-stub",
+                "enabled": True,
+                "max_concurrent_jobs": 1,
+            },
+            check=False,
+        )
+        worker.status = "HEALTHY"
+        session.add(worker)
+        session.commit()
+
+        task = orchestrator.create_task(
+            {
+                "workflow_id": workflow.id,
+                "variable_pool_id": pool.id,
+                "prompt_template": "render {style}",
+                "batch_size": 3,
+                "seeds_per_prompt": 3,
+                "target_prompts": 1,
+            }
+        )
+
+        orchestrator.run_pilot(task.id)
+
+        assert http_client.payloads, "No payload submitted to ComfyUI"
+        payload = http_client.payloads[0]
+        assert payload["batch_size"] == 3
+        assert len(payload.get("seed_list", [])) == 3
+        sampler_inputs = payload["prompt"]["1"]["inputs"]
+        behavior_inputs = payload["prompt"]["2"]["inputs"]
+        assert sampler_inputs["seed"] == payload["seed_list"][0]
+        assert sampler_inputs["batch_size"] == 3
+        assert behavior_inputs["seed_list"] == payload["seed_list"]
+
+
 def test_retries_reduce_resolution_on_oom(monkeypatch):
     engine = get_engine()
 

@@ -50,6 +50,7 @@ class PromptRequest(BaseModel):
     extra_data: dict = Field(default_factory=dict)
     seed: int | None = None
     batch_size: int = 1
+    seed_list: list[int] | None = None
 
 
 @dataclass
@@ -150,6 +151,7 @@ class ComfyStub:
                 "workflow_api": body.workflow_api,
                 "prompt": body.prompt,
                 "seed": body.seed,
+                "seed_list": body.seed_list or [],
                 "batch_size": body.batch_size,
                 "client_id": body.client_id,
                 "extra_data": body.extra_data,

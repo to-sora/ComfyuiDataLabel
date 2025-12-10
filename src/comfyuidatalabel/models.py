@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from sqlalchemy import JSON, Column
@@ -26,7 +26,7 @@ class VariablePool(SQLModel, table=True):
     name: str
     version: str
     sampling_mode: str = Field(default="permutation")  # permutation | no_replacement
-    variables: Dict[str, List[str]] = Field(default_factory=dict, sa_column=Column(JSON))
+    variables: Dict[str, List[Any]] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
     tasks: list["Task"] = Relationship(back_populates="variable_pool")
@@ -76,6 +76,7 @@ class TaskPrompt(SQLModel, table=True):
     task_id: str = Field(foreign_key="task.id")
     prompt: str
     seed: int
+    seed_list: List[int] = Field(default_factory=list, sa_column=Column(JSON))
     prompt_id: Optional[str] = None
     client_id: Optional[str] = None
     mode: str = Field(default="pilot")  # pilot | mass
