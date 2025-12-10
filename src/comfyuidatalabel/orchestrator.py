@@ -6,7 +6,7 @@ import json
 import random
 import time
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import httpx
 from httpx import Client
@@ -329,10 +329,10 @@ class SmartOrchestrator:
         }
 
     @staticmethod
-    def _with_overrides(workflow_api: Dict[str, object], overrides: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+    def _with_overrides(workflow_api: Dict[str, Any], overrides: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+        workflow = copy.deepcopy(workflow_api) if workflow_api is not None else {}
         if not overrides:
-            return workflow_api
-        workflow = copy.deepcopy(workflow_api)
+            return workflow
         nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
         if isinstance(nodes, list):
             node_map = {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
