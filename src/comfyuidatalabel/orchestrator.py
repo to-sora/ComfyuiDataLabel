@@ -4,7 +4,7 @@ import itertools
 import random
 import time
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import httpx
 from httpx import Client
@@ -13,10 +13,29 @@ from sqlmodel import Session, select
 from .models import Annotation, Task, TaskPrompt, VariablePool, Worker, Workflow
 
 
+def _version_at_least(version: str, minimum: str) -> bool:
+    def _parts(value: str) -> List[int]:
+        return [int(part) for part in value.split(".") if part.isdigit()]
+
+    current_parts = _parts(version)
+    minimum_parts = _parts(minimum)
+    # Pad shorter list for comparison
+    length = max(len(current_parts), len(minimum_parts))
+    current_parts.extend([0] * (length - len(current_parts)))
+    minimum_parts.extend([0] * (length - len(minimum_parts)))
+    return current_parts >= minimum_parts
+
+
 class WorkerRegistry:
     def __init__(self, session: Session, http_client: Client | None = None):
         self.session = session
         self.http_client = http_client or httpx.Client(timeout=2.5)
+
+    @staticmethod
+    def _headers(worker: Worker) -> Dict[str, str]:
+        if not worker.api_key:
+            return {}
+        return {"Authorization": f"Bearer {worker.api_key}", "X-API-Key": worker.api_key}
 
     def healthy_workers(self) -> List[Worker]:
         result = self.session.exec(
@@ -43,10 +62,28 @@ class WorkerRegistry:
         self.session.commit()
         self.session.refresh(worker)
 
-    def check_worker_health(self, worker: Worker, timeout: float = 2.5) -> Worker:
+    def check_worker_health(
+        self,
+        worker: Worker,
+        timeout: float = 2.5,
+        *,
+        min_version: str | None = None,
+        required_features: Sequence[str] | None = None,
+    ) -> Worker:
+        headers = self._headers(worker)
         try:
-            self.http_client.get(f"{worker.base_url}/system_stats")
-            self.http_client.get(f"{worker.base_url}/queue")
+            system_resp = self.http_client.get(f"{worker.base_url}/system_stats", headers=headers)
+            queue_resp = self.http_client.get(f"{worker.base_url}/queue", headers=headers)
+            system_resp.raise_for_status()
+            queue_resp.raise_for_status()
+            system_stats = system_resp.json()
+            if min_version and not _version_at_least(system_stats.get("version", "0.0.0"), min_version):
+                raise RuntimeError("Worker version is below the minimum supported")
+            if required_features:
+                features = set(system_stats.get("features", []))
+                missing = set(required_features) - features
+                if missing:
+                    raise RuntimeError(f"Missing required features: {', '.join(sorted(missing))}")
             worker.status = "HEALTHY"
         except Exception:
             worker.status = "UNHEALTHY"
@@ -243,7 +280,11 @@ class SmartOrchestrator:
             "seed": prompt.seed,
             "batch_size": prompt.batch_size,
         }
-        response = self.http_client.post(prompt.worker_endpoint, json=payload)
+        response = self.http_client.post(
+            prompt.worker_endpoint,
+            json=payload,
+            headers=WorkerRegistry._headers(worker),
+        )
         response.raise_for_status()
         prompt.status = "queued"
         self.session.add(prompt)

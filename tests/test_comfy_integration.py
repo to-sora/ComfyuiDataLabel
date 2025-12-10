@@ -11,7 +11,11 @@ from sqlmodel import Session, SQLModel
 
 from comfyuidatalabel.database import get_engine, init_db
 from comfyuidatalabel.orchestrator import SmartOrchestrator
+from comfyuidatalabel.orchestrator import WorkerRegistry
+from comfyuidatalabel.models import Worker
+from comfyuidatalabel.comfy_server import stub
 from .helpers import comfy_stub_client
+import time
 
 
 CURRENT_DB = None
@@ -115,3 +119,38 @@ def test_no_workers_available():
         )
         with pytest.raises(RuntimeError):
             orchestrator.run_pilot(task.id)
+
+
+def test_worker_health_checks_require_version_and_api_key():
+    stub.reset()
+    stub.api_key = "secret"
+    http_client = comfy_stub_client(api_key="secret")
+
+    engine = get_engine()
+    with Session(engine) as session:
+        worker = Worker(name="auth-worker", base_url="http://comfy-stub", api_key="secret")
+        session.add(worker)
+        session.commit()
+        session.refresh(worker)
+
+        registry = WorkerRegistry(session, http_client=http_client)
+        checked = registry.check_worker_health(worker, min_version="1.0.0", required_features=["controlnet"])
+        assert checked.status == "HEALTHY"
+
+        # Version too high or missing features should mark worker unhealthy
+        checked = registry.check_worker_health(worker, min_version="9.9.9", required_features=["nonexistent"])
+        assert checked.status == "UNHEALTHY"
+
+
+def test_prompt_history_progresses():
+    stub.reset()
+    http_client = comfy_stub_client()
+    payload = {"workflow_api": {}, "prompt": "integration", "seed": 7, "batch_size": 1}
+    resp = http_client.post("/prompt", json=payload)
+    prompt_id = resp.json()["prompt_id"]
+
+    # Allow async progression to complete
+    time.sleep(0.05)
+    history = http_client.get(f"/history/{prompt_id}").json()["history"][prompt_id]
+    assert history["status"] == "completed"
+    assert history["images"]
