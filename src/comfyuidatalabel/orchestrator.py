@@ -6,7 +6,7 @@ import json
 import random
 import time
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import httpx
 from httpx import Client
