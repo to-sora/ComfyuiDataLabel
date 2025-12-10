@@ -43,8 +43,10 @@ class Worker(SQLModel, table=True):
     api_key: Optional[str] = None
     enabled: bool = True
     status: str = Field(default="UNKNOWN")  # HEALTHY | UNHEALTHY | UNKNOWN
+    priority: int = Field(default=0)
     max_concurrent_jobs: int = Field(default=1, ge=1)
     current_jobs: int = Field(default=0, ge=0)
+    queue_length: int = Field(default=0, ge=0)
     tags: List[str] = Field(default_factory=list, sa_column=Column(JSON))
     last_health_check: Optional[datetime] = None
 

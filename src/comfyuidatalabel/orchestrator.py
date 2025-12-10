@@ -46,21 +46,61 @@ class WorkerRegistry:
         )
         return list(result)
 
-    def select(self) -> Optional[Worker]:
-        workers = sorted(self.healthy_workers(), key=lambda w: (w.current_jobs, w.name))
+    def select(self, candidates: Optional[Sequence[Worker]] = None) -> Optional[Worker]:
+        workers = sorted(
+            candidates if candidates is not None else self.healthy_workers(),
+            key=lambda w: (-w.priority, w.queue_length, w.name),
+        )
         for worker in workers:
-            if worker.current_jobs < worker.max_concurrent_jobs:
+            try:
+                queue_length, _, _ = self.sync_queue_length(worker)
+            except Exception:
+                continue
+            if queue_length < worker.max_concurrent_jobs:
                 return worker
         return None
 
+    def _queue_counts(self, worker: Worker) -> tuple[int, int]:
+        headers = self._headers(worker)
+        queue_resp = self.http_client.get(f"{worker.base_url}/queue", headers=headers)
+        queue_resp.raise_for_status()
+        queue_data = queue_resp.json()
+
+        def _length(value: object) -> int:
+            if isinstance(value, list):
+                return len(value)
+            if isinstance(value, int):
+                return value
+            return 0
+
+        pending = _length(queue_data.get("queue_pending") or queue_data.get("pending"))
+        running = _length(queue_data.get("queue_running") or queue_data.get("running"))
+        return pending, running
+
+    def sync_queue_length(self, worker: Worker) -> tuple[int, int, int]:
+        pending = running = 0
+        try:
+            pending, running = self._queue_counts(worker)
+            worker.queue_length = pending + running
+        except Exception:
+            worker.queue_length = 0
+            raise
+        finally:
+            self.session.add(worker)
+            self.session.commit()
+            self.session.refresh(worker)
+        return worker.queue_length, pending, running
+
     def record_job(self, worker: Worker) -> None:
         worker.current_jobs += 1
+        worker.queue_length = max(worker.queue_length, worker.current_jobs)
         self.session.add(worker)
         self.session.commit()
         self.session.refresh(worker)
 
     def complete_job(self, worker: Worker) -> None:
         worker.current_jobs = max(worker.current_jobs - 1, 0)
+        worker.queue_length = max(worker.queue_length - 1, worker.current_jobs)
         self.session.add(worker)
         self.session.commit()
         self.session.refresh(worker)
@@ -76,10 +116,10 @@ class WorkerRegistry:
         headers = self._headers(worker)
         try:
             system_resp = self.http_client.get(f"{worker.base_url}/system_stats", headers=headers)
-            queue_resp = self.http_client.get(f"{worker.base_url}/queue", headers=headers)
             system_resp.raise_for_status()
-            queue_resp.raise_for_status()
             system_stats = system_resp.json()
+            pending, running = self._queue_counts(worker)
+            worker.queue_length = pending + running
             if min_version and not _version_at_least(system_stats.get("version", "0.0.0"), min_version):
                 raise RuntimeError("Worker version is below the minimum supported")
             if required_features:
@@ -90,6 +130,7 @@ class WorkerRegistry:
             worker.status = "HEALTHY"
         except Exception:
             worker.status = "UNHEALTHY"
+            worker.queue_length = 0
         worker.last_health_check = datetime.utcnow()
         self.session.add(worker)
         self.session.commit()
@@ -223,9 +264,12 @@ class SmartOrchestrator:
         return prompt
 
     def _select_worker_or_raise(self) -> Worker:
-        worker = self.registry.select()
+        healthy = self.registry.healthy_workers()
+        if not healthy:
+            raise RuntimeError("No healthy workers available to run prompts")
+        worker = self.registry.select(candidates=healthy)
         if not worker:
-            raise RuntimeError("No healthy workers available")
+            raise RuntimeError("All healthy workers are at capacity; try again later")
         return worker
 
     def _generate_prompts(self, task: Task) -> List[Dict[str, object]]:
@@ -297,6 +341,7 @@ class SmartOrchestrator:
         self.session.refresh(task)
 
     def _simulate_comfy_call(self, worker: Worker, workflow: Workflow, prompt: TaskPrompt) -> Dict[str, str]:
+        self._wait_for_capacity(worker)
         prompt.worker_endpoint = f"{worker.base_url}/prompt"
         prompt.client_id = prompt.client_id or prompt.task.client_id or f"client-{uuid4()}"
         workflow_graph = self._with_overrides(workflow.workflow_api, prompt.applied_inputs)
@@ -321,6 +366,10 @@ class SmartOrchestrator:
         prompt.updated_at = datetime.utcnow()
         self.session.add(prompt)
         self.session.commit()
+        try:
+            self.registry.sync_queue_length(worker)
+        except Exception:
+            pass
         self._track_prompt(worker, prompt)
         return {
             "worker": worker.base_url,
@@ -365,6 +414,16 @@ class SmartOrchestrator:
         if isinstance(nodes, dict):
             return {str(node_id): node for node_id, node in nodes.items() if isinstance(node, dict)}
         return {}
+
+    def _wait_for_capacity(self, worker: Worker, *, backoff: float = 0.5) -> None:
+        while True:
+            try:
+                queue_length, pending, running = self.registry.sync_queue_length(worker)
+            except Exception as exc:
+                raise RuntimeError(f"Worker {worker.name} unavailable: {exc}") from exc
+            if pending + running < worker.max_concurrent_jobs:
+                return
+            time.sleep(backoff)
 
     def _track_prompt(self, worker: Worker, prompt: TaskPrompt, timeout: float = 2.0) -> None:
         if not prompt.prompt_id:
