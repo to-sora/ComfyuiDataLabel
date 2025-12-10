@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Task {{ task.id }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 1rem; background: #0f172a; color: #e2e8f0; }
+        .card { background: #111827; padding: 1rem; border-radius: 12px; margin-bottom: 1rem; }
+        button { padding: 0.6rem 1rem; border: none; border-radius: 10px; background: #22d3ee; color: #0b1220; font-weight: bold; margin-right: 0.5rem; }
+        .prompt { padding: 0.75rem; background: #0b1220; border-radius: 8px; margin-bottom: 0.5rem; }
+        .annotation button { margin-top: 0.25rem; width: 100%; }
+        .muted { color: #94a3b8; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+    <a href="/" style="color:#38bdf8">← Back</a>
+    <h1>Task {{ task.id }}</h1>
+    <div class="muted">Status: {{ task.status }} | Workflow: {{ task.workflow_id }}</div>
+
+    <div class="card">
+        <button onclick="pilot()">Run Pilot</button>
+        <button onclick="freezeTask()">Freeze</button>
+        <button onclick="generate()">Mass Generate</button>
+    </div>
+
+    <div class="card">
+        <h2>Prompts & Seeds</h2>
+        {% for prompt in prompts %}
+        <div class="prompt">
+            <div>{{ prompt.prompt }}</div>
+            <div class="muted">seed: {{ prompt.seed }} | mode: {{ prompt.mode }}</div>
+            <div class="annotation">
+                <button onclick="annotate('{{ prompt.id }}','A')">A - Prefer</button>
+                <button onclick="annotate('{{ prompt.id }}','B')">B - Alternative</button>
+                <button onclick="annotate('{{ prompt.id }}','N')">N - Reject</button>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+<script>
+async function pilot(){ await fetch(`/tasks/{{ task.id }}/pilot`, {method:'POST'}); location.reload(); }
+async function freezeTask(){ await fetch(`/tasks/{{ task.id }}/freeze`, {method:'POST'}); location.reload(); }
+async function generate(){ await fetch(`/tasks/{{ task.id }}/generate`, {method:'POST'}); location.reload(); }
+async function annotate(promptId, choice){
+    await fetch(`/prompts/${promptId}/annotations`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({choice})});
+    alert('Saved annotation for '+promptId);
+}
+</script>
+</body>
+</html>
