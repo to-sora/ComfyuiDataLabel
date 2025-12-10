@@ -5,6 +5,7 @@ import random
 import time
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
+from uuid import uuid4
 
 import httpx
 from httpx import Client
@@ -237,18 +238,26 @@ class SmartOrchestrator:
 
     def _simulate_comfy_call(self, worker: Worker, workflow: Workflow, prompt: TaskPrompt) -> Dict[str, str]:
         prompt.worker_endpoint = f"{worker.base_url}/prompt"
+        client_id = f"client-{uuid4().hex}"
+        workflow_graph = workflow.workflow_api.get("workflow", workflow.workflow_api)
+        workflow_inputs = workflow.workflow_api.get("inputs", {})
+        extra_data = workflow.workflow_api.get("extra_data", {})
         payload = {
-            "workflow_api": workflow.workflow_api,
-            "prompt": prompt.prompt,
-            "seed": prompt.seed,
-            "batch_size": prompt.batch_size,
+            "prompt": workflow_graph,
+            "client_id": client_id,
+            "workflow_api": workflow_inputs,
+            "extra_data": extra_data,
         }
         response = self.http_client.post(prompt.worker_endpoint, json=payload)
         response.raise_for_status()
         prompt.status = "queued"
+        prompt.client_id = client_id
+        prompt.prompt_id = response.json().get("prompt_id")
+        prompt.queued_at = datetime.utcnow()
+        prompt.updated_at = datetime.utcnow()
         self.session.add(prompt)
         self.session.commit()
-        result = response.json()
+        self._track_prompt(worker, prompt)
         return {
             "worker": worker.base_url,
             "workflow": workflow.name,
@@ -257,5 +266,82 @@ class SmartOrchestrator:
             "mode": prompt.mode,
             "batch_size": str(prompt.batch_size),
             "endpoint": prompt.worker_endpoint,
-            "prompt_id": result.get("prompt_id", ""),
+            "prompt_id": prompt.prompt_id or "",
+            "client_id": prompt.client_id or "",
+            "status": prompt.status,
         }
+
+    def _track_prompt(self, worker: Worker, prompt: TaskPrompt) -> None:
+        queue_endpoint = f"{worker.base_url}/queue"
+        history_endpoint = f"{worker.base_url}/history/{prompt.client_id}"
+        attempts = 0
+        max_attempts = 10
+        poll_interval = 0.25
+        while attempts < max_attempts:
+            attempts += 1
+            queue_status = {}
+            try:
+                queue_status = self.http_client.get(queue_endpoint).json()
+            except Exception:
+                pass
+            self._update_status_from_queue(prompt, queue_status)
+            history_payload = {}
+            try:
+                history_payload = self.http_client.get(history_endpoint).json()
+            except Exception:
+                pass
+            prompt_history = self._extract_prompt_history(history_payload, prompt.prompt_id)
+            if prompt_history:
+                status = prompt_history.get("status")
+                outputs = prompt_history.get("outputs", {})
+                error = prompt_history.get("error")
+                if status:
+                    prompt.status = status
+                    if status == "running" and not prompt.started_at:
+                        prompt.started_at = datetime.utcnow()
+                    if status in {"completed", "success"}:
+                        prompt.completed_at = datetime.utcnow()
+                    if status in {"failed", "error"}:
+                        prompt.failed_at = datetime.utcnow()
+                        prompt.error = error or prompt_history.get("status_text")
+                if outputs:
+                    prompt.node_outputs = outputs
+                if error and not prompt.error:
+                    prompt.error = error
+                prompt.updated_at = datetime.utcnow()
+                self.session.add(prompt)
+                self.session.commit()
+                if status in {"completed", "success", "failed", "error"}:
+                    break
+            else:
+                prompt.updated_at = datetime.utcnow()
+                self.session.add(prompt)
+                self.session.commit()
+            time.sleep(poll_interval)
+
+    def _extract_prompt_history(self, payload: Dict[str, object], prompt_id: Optional[str]) -> Dict[str, object]:
+        history = payload.get("history") if isinstance(payload, dict) else None
+        if isinstance(history, dict) and prompt_id:
+            record = history.get(prompt_id)
+            if isinstance(record, dict):
+                return record
+        if isinstance(payload, dict) and prompt_id and payload.get("prompt_id") == prompt_id:
+            return payload
+        if isinstance(payload, dict) and not prompt_id:
+            return payload
+        return {}
+
+    def _update_status_from_queue(self, prompt: TaskPrompt, queue_status: Dict[str, object]) -> None:
+        if not queue_status or not prompt.prompt_id:
+            return
+        running = queue_status.get("queue_running", []) or []
+        pending = queue_status.get("queue_pending", []) or []
+        if any(item.get("prompt_id") == prompt.prompt_id for item in running if isinstance(item, dict)):
+            prompt.status = "running"
+            prompt.started_at = prompt.started_at or datetime.utcnow()
+        elif any(item.get("prompt_id") == prompt.prompt_id for item in pending if isinstance(item, dict)):
+            prompt.status = "queued"
+            prompt.queued_at = prompt.queued_at or datetime.utcnow()
+        prompt.updated_at = datetime.utcnow()
+        self.session.add(prompt)
+        self.session.commit()

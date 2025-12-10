@@ -75,11 +75,15 @@ def test_task_lifecycle_with_variable_pool():
 
         pilot_jobs = orchestrator.run_pilot(task.id)
         assert len(pilot_jobs) >= 1
+        assert pilot_jobs[0]["status"] in {"completed", "success"}
 
         orchestrator.freeze_task(task.id)
         mass_jobs = orchestrator.generate(task.id)
         assert len(mass_jobs) == len(task.prompts) - len(pilot_jobs)
         first_prompt = session.get(TaskPrompt, task.prompts[0].id)
+        assert first_prompt.prompt_id is not None
+        assert first_prompt.client_id is not None
+        assert first_prompt.node_outputs is not None
         ann = orchestrator.annotate(first_prompt.id, {"choice": "A", "comment": "Great"})
         assert ann.choice == "A"
 

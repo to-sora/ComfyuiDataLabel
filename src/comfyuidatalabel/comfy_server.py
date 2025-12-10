@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import base64
 import io
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from uuid import uuid4
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -31,17 +33,38 @@ def _blank_image(width: int = 512, height: int = 512) -> str:
 
 class PromptRequest(BaseModel):
     workflow_api: dict = Field(default_factory=dict)
-    prompt: str
-    seed: int
-    batch_size: int = 1
+    prompt: dict
+    client_id: str
+    extra_data: dict = Field(default_factory=dict)
 
 
 @dataclass
 class ComfyStub:
     app: FastAPI = FastAPI(title="Mock ComfyUI")
+    jobs: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.register_routes()
+
+    def _next_outputs(self, prompt_id: str) -> dict:
+        filename = f"{prompt_id}.png"
+        return {
+            "images": [
+                {
+                    "filename": filename,
+                    "subfolder": "outputs",
+                    "type": "output",
+                }
+            ]
+        }
+
+    def _advance_jobs(self) -> None:
+        for job in self.jobs.values():
+            if job["status"] == "queued":
+                job["status"] = "running"
+            elif job["status"] == "running":
+                job["status"] = "completed"
+                job["outputs"] = self._next_outputs(job["prompt_id"])
 
     def register_routes(self) -> None:
         @self.app.get("/system_stats")
@@ -50,17 +73,48 @@ class ComfyStub:
 
         @self.app.get("/queue")
         def queue():
-            return {"queue_running": [], "queue_pending": []}
+            self._advance_jobs()
+            running = [
+                {"prompt_id": pid, "status": job["status"]}
+                for pid, job in self.jobs.items()
+                if job["status"] in {"running", "completed"}
+            ]
+            pending = [
+                {"prompt_id": pid, "status": job["status"]}
+                for pid, job in self.jobs.items()
+                if job["status"] == "queued"
+            ]
+            return {"queue_running": running, "queue_pending": pending}
 
         @self.app.post("/prompt")
         def submit_prompt(body: PromptRequest):
-            return {
-                "prompt_id": f"job-{body.seed}",
-                "status": "submitted",
-                "images": [_blank_image()],
-                "seed": body.seed,
-                "batch_size": body.batch_size,
+            prompt_id = f"job-{uuid4().hex[:8]}"
+            self.jobs[prompt_id] = {
+                "prompt_id": prompt_id,
+                "client_id": body.client_id,
+                "status": "queued",
+                "submitted_at": time.time(),
+                "outputs": {},
             }
+            return {
+                "prompt_id": prompt_id,
+                "client_id": body.client_id,
+                "status": "queued",
+                "images": [_blank_image()],
+            }
+
+        @self.app.get("/history/{client_id}")
+        def history(client_id: str):
+            self._advance_jobs()
+            history_records = {}
+            for prompt_id, job in self.jobs.items():
+                if job.get("client_id") != client_id:
+                    continue
+                history_records[prompt_id] = {
+                    "status": job["status"],
+                    "outputs": job.get("outputs", {}),
+                }
+            return {"client_id": client_id, "history": history_records}
 
 
 stub = ComfyStub()
