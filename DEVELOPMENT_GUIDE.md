@@ -8,6 +8,11 @@
 - **Smart Orchestrator**: worker selection (priority → queue length), queue-depth gating, dual-loop batching, retries, health checks.
 - **Annotation Workbench**: mobile-first labeling with prefetch, thumbnails, spam/chosen/rejected, and A/B/N.
 
+### 1.1 Scale & Concurrency Guardrails
+- **Concurrent users**: target ≥10 active annotators/operators without degraded latency. Keep HTTP handlers stateless; cache hot lookups (worker list, workflow metadata, variable pools) in Redis with ≤60s TTL.
+- **Throughput assumptions**: orchestrator must support ≥5 concurrent task submissions and ≥3 simultaneous DPO exports; enforce per-user/task rate limits and debounce duplicate clicks in UI.
+- **Back-pressure**: central queue service (e.g., Redis streams) fronts worker submissions; if queue depth > threshold, return 429 with retry-after and surface banner in UI. Combine with worker queue gating (`pending + running < max_concurrent_jobs`).
+
 ## 2. Backend API (example contracts)
 _All endpoints return `{ "success": boolean, "data": any, "error": string | null }` unless specified._
 
@@ -66,6 +71,12 @@ _All endpoints return `{ "success": boolean, "data": any, "error": string | null
   - Streams JSONL; each line `{ prompt, chosen: { uri, seed }, rejected: { uri, seed }[], workflow_id, model, variable_pool_version, created_at }`.
 
 ### 2.7 ComfyUI Passthrough (per worker)
+- `POST {worker.base_url}/prompt`
+- `GET {worker.base_url}/queue`
+- `GET {worker.base_url}/history/{prompt_id}`
+- `POST {worker.base_url}/interrupt`
+- `POST {worker.base_url}/free`
+- For fully headless usage, API payload examples, workflow file anatomy、每个端点的请求/响应字段与官方链接，参见 `COMFY_HEADLESS_GUIDE.md`（离线阅读即可完成接入）。
 Use the official ComfyUI HTTP routes (no need to rely on https://www.comfy.org/zh-cn/). Each endpoint below includes the exact
 docs.comfy.org page so developers can implement without any other reference:
 
@@ -307,6 +318,9 @@ unique (test_id, user_id)
 - **Partitioning**: `generations` table monthly partitions; nightly vacuum/compaction jobs; index on `(task_id, prompt_id)`.
 - **Metadata cache**: Redis for per-prompt status to keep UI responsive when listing 200k+ images.
 - **Prefetch**: UI fetches manifest `batches` containing thumbnail URLs for next/previous 20 items; use CDN `preconnect`/`prefetch` headers.
+- **Manifest snapshots**: write per-task immutable manifests (JSONL) of `{batch_id, prompt, seed, thumbnail_uri, fullres_uri, checksum}` after freeze. Store manifest path in DB to avoid enumerating storage when exporting or paginating 200k+ items.
+- **Cold storage policy**: move rarely accessed full-res images to cheaper tier after N days; keep thumbnails/hashes hot for labeling integrity checks.
+- **Observability**: emit metrics for upload latency, CDN cache hit rate, and DB/Redis query times to catch regressions with 200k-image catalogs.
 
 ## 7. Orchestrator Rules
 - Select workers: enabled + HEALTHY → sort by priority then `current_queue_len` → pick first.
@@ -323,9 +337,13 @@ unique (test_id, user_id)
 - Batch seed handling respects `LatentBatchSeedBehavior`; fallback loop works when node absent.
 - Freeze immutability: prompts/seeds/workflow snapshot cannot change post-freeze; DPO export matches stored metadata/URIs.
 - CDN preload test: next-20 thumbnails fetched; verify signed-URL validity and cache headers.
+- Concurrency test: simulate ≥10 concurrent annotators + task creators hitting `/api/tasks`, `/api/tasks/{id}/progress`, and `/api/annotations`; assert p95 latency <1s and no queue depth violations.
+- Export soak test: stream `GET /api/tasks/{id}/export/dpo` for 200k-image tasks; ensure memory usage stays <512MB and throughput ≥50 JSONL lines/sec with checksum validation.
 
 ## 9. Deployment Notes
 - External ComfyUI workers act as GPU nodes; orchestrator must never submit when no HEALTHY worker.
 - Configure admin `Max_Workflow_Batch_Size`, ControlNet allowances, and resolution guardrails server-side.
 - Default queue-depth threshold: 1 (configurable). Alerts on worker UNHEALTHY or queue backlog.
+- Sticky worker tokens/API keys must be stored per-worker; rotate keys without restarts by reloading registry cache.
+- DPO export endpoints should run as streaming handlers (chunked transfer) behind CDN disabled paths to avoid buffering.
 
