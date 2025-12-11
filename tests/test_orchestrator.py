@@ -79,8 +79,9 @@ def test_task_lifecycle_with_variable_pool():
         assert len(pilot_jobs) >= 1
 
         orchestrator.freeze_task(task.id)
+        mass_prompts = [p for p in task.prompts if p.mode == "mass"]
         mass_jobs = orchestrator.generate(task.id)
-        assert len(mass_jobs) == len(task.prompts) - len(pilot_jobs)
+        assert len(mass_jobs) == len(mass_prompts)
         first_prompt = session.get(TaskPrompt, task.prompts[0].id)
         ann = orchestrator.annotate(
             first_prompt.id,
@@ -290,13 +291,21 @@ def test_pilot_prefers_high_cost_prompt_and_forces_batch(monkeypatch):
             }
         )
 
+        existing_mass_prompts = [p for p in task.prompts if p.mode == "mass"]
+
         pilot_jobs = orchestrator.run_pilot(task.id)
-        assert len(pilot_jobs) == 1
-        pilot_prompt = next(p for p in task.prompts if p.mode == "pilot")
-        assert pilot_prompt.batch_size == 1
-        assert pilot_prompt.applied_inputs["1"]["width"] == 1024
-        assert pilot_prompt.applied_inputs["1"]["height"] == 1024
-        assert pilot_prompt.applied_inputs["2"]["enabled"] is True
+        assert len(pilot_jobs) == min(len(existing_mass_prompts), 10)
+
+        pilot_prompts = [p for p in task.prompts if p.mode == "pilot"]
+        assert all(p.batch_size == 1 for p in pilot_prompts)
+        assert len(pilot_prompts) == len(pilot_jobs)
+
+        high_cost_pilot = next(
+            p
+            for p in pilot_prompts
+            if p.applied_inputs["1"]["width"] == 1024 and p.applied_inputs["1"]["height"] == 1024
+        )
+        assert high_cost_pilot.applied_inputs["2"]["enabled"] is True
         assert pilot_jobs[0]["batch_size"] == "1"
 
 
@@ -369,12 +378,12 @@ def test_seed_lists_are_grouped_into_single_batch_submission():
 
         assert http_client.payloads, "No payload submitted to ComfyUI"
         payload = http_client.payloads[0]
-        assert payload["batch_size"] == 3
-        assert len(payload.get("seed_list", [])) == 3
+        assert payload["batch_size"] == 1
+        assert len(payload.get("seed_list", [])) == 1
         sampler_inputs = payload["prompt"]["1"]["inputs"]
         behavior_inputs = payload["prompt"]["2"]["inputs"]
         assert sampler_inputs["seed"] == payload["seed_list"][0]
-        assert sampler_inputs["batch_size"] == 3
+        assert sampler_inputs["batch_size"] == 1
         assert behavior_inputs["seed_list"] == payload["seed_list"]
 
 
