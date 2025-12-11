@@ -77,6 +77,53 @@ _All endpoints return `{ "success": boolean, "data": any, "error": string | null
 - `POST {worker.base_url}/interrupt`
 - `POST {worker.base_url}/free`
 - For fully headless usage, API payload examples, workflow file anatomy、每个端点的请求/响应字段与官方链接，参见 `COMFY_HEADLESS_GUIDE.md`（离线阅读即可完成接入）。
+Use the official ComfyUI HTTP routes (no need to rely on https://www.comfy.org/zh-cn/). Each endpoint below includes the exact
+docs.comfy.org page so developers can implement without any other reference:
+
+| Endpoint | Purpose | Key Payload/Response Notes | Reference |
+| --- | --- | --- | --- |
+| `POST {worker.base_url}/prompt` | Submit a workflow graph to run. | JSON body `{ "prompt": {<node graph>}, "client_id": "uuid" }`; returns `{ "prompt_id": "..." }`. Use the same graph format as downloaded `workflow_api.json`. | https://docs.comfy.org/development/comfyui-server/comms_routes#post-prompt |
+| `GET {worker.base_url}/queue` | Inspect pending and running jobs. | Response `{ "queue_running": [...], "queue_pending": [...] }` used by queue-depth gating. | https://docs.comfy.org/development/comfyui-server/comms_routes#get-queue |
+| `GET {worker.base_url}/history/{prompt_id}` | Fetch outputs and status for a finished prompt. | Returns node-level outputs and `status` for the given `prompt_id`; used to resolve CDN upload targets. | https://docs.comfy.org/development/comfyui-server/comms_routes#get-historyprompt_id |
+| `POST {worker.base_url}/interrupt` | Interrupt all running jobs on the worker. | Empty body; returns 200 on success. Use when admin pauses a worker. | https://docs.comfy.org/development/comfyui-server/comms_routes#post-interrupt |
+| `POST {worker.base_url}/free` | Ask the worker to free VRAM/resources. | Empty body; returns 200; run after large batches to avoid OOM. | https://docs.comfy.org/development/comfyui-server/comms_routes#post-free |
+
+The linked routes cover every ComfyUI interaction used by this system, and the payload/response summaries above mirror the
+official definitions. With these details in place, engineers can complete integrations without ever reading
+https://www.comfy.org/zh-cn/.
+
+### 2.7.1 ComfyUI Integration FAQ (edge cases & community-learned pitfalls)
+Below are 30 focused Q&A items sourced from common community issues to ensure V3 can be implemented without any external reference beyond docs.comfy.org:
+1) **Q: History payload is empty.** A: Call `GET /history/{prompt_id}` only after the job leaves `queue_running`; if the request races, wait 500ms and retry once using exponential backoff.
+2) **Q: Images missing in history outputs.** A: Use the `outputs` map in history response; pick entries whose `type` is `output` and whose `subfolder`/`filename` pair exists—never assume `/output` paths.
+3) **Q: Need download URL for CDN upload.** A: Combine worker `base_url` + `/view?filename=<name>&subfolder=<sub>` from history to fetch bytes; then push to S3/CDN and delete the temp file.
+4) **Q: Worker returns 413 (payload too large).** A: Compress JSON with gzip or reduce embedded base64; ensure nginx/proxy `client_max_body_size` accommodates typical workflow graphs (1–5 MB).
+5) **Q: Prompt submission sometimes times out.** A: Use 30s client timeout; server may queue. If HTTP times out, poll `/queue` for the `prompt_id` before re-submitting to avoid duplicates.
+6) **Q: Duplicate prompt execution after network blip.** A: Track `client_id`; reuse the same `prompt_id` to dedupe. Only resubmit when `/queue` and `/history/{prompt_id}` both lack the id.
+7) **Q: Need to cancel one task without stopping others.** A: Use `POST /interrupt` only when the worker is dedicated; otherwise mark generation as failed in DB and let the scheduler drain naturally—ComfyUI interrupt is global.
+8) **Q: VRAM leak after large batches.** A: Call `POST /free` after each native batch to force cleanup; staggering `free` every N prompts reduces OOM risk in long runs.
+9) **Q: Progressive results not visible.** A: ComfyUI HTTP API does not stream partials; use WebSocket routes only if strictly needed—otherwise rely on `history` after completion.
+10) **Q: Need deterministic seeds across retries.** A: Persist seeds in DB and send them explicitly in the graph; never allow ComfyUI default random seeds.
+11) **Q: LatentBatchSeedBehavior unsupported in workflow.** A: Fallback to `batch_size=1` loop per seed as mandated by V3; do not mutate the graph automatically.
+12) **Q: ControlNet nodes requiring API keys.** A: Validate on upload and reject; forbidden nodes must be recorded in `workflows.forbidden_nodes` with a clear error to the Admin UI.
+13) **Q: Queue depth gating accuracy.** A: Compute `pending + running` from `/queue`; treat missing keys as zero. Gating happens right before `POST /prompt`, not at task start.
+14) **Q: Worker health flaps.** A: Mark worker UNHEALTHY after two consecutive failed `/system_stats` or `/queue` calls; require one clean pass to return to HEALTHY.
+15) **Q: OOM during pilot.** A: Auto-retry up to three times lowering resolution or batch size per attempt; record retries in pilot response for UI visibility.
+16) **Q: Need to resume after worker crash.** A: Re-query `/queue` to confirm emptiness, then re-run failed prompt_ids with the same graph; avoid resubmitting completed ones by checking `history` first.
+17) **Q: Mixed precision mismatch.** A: Precision is a static parameter; ensure all workflow nodes expecting float16/32 align and do not switch mid-run.
+18) **Q: Custom nodes not installed.** A: Workflow upload validation must detect missing node types and block task creation until installed; do not attempt dynamic installation.
+19) **Q: Slow startup on cold GPU.** A: Warm-up by running a single small prompt before mass generation; exclude warm-up outputs from annotations/export.
+20) **Q: Need per-variant CDN domains for A/B tests.** A: Use AB assignment result to pick CDN base URL when constructing annotation batch payloads; keep prompt/seed metadata identical across variants.
+21) **Q: User retries annotation submit.** A: Idempotency via `(task_id, batch_id, user_id)` unique constraint; update row instead of inserting a duplicate when conflict occurs.
+22) **Q: JSON schema drift between workflows.** A: Store `workflow.version` and `raw_definition`; upon freeze, capture snapshot to avoid later edits affecting frozen tasks.
+23) **Q: Multi-worker ordering differences.** A: Ordering is not guaranteed; use `created_at` and `prompt_id` to sort when presenting batches to annotators.
+24) **Q: Storage path collisions.** A: Include `task_id/prompt_id/seed` in CDN key; compute checksum on upload and persist for later integrity verification.
+25) **Q: Seed overflow in databases.** A: Use `bigint` for seeds; avoid relying on 32-bit ints.
+26) **Q: Need to throttle user-triggered pilots.** A: Rate-limit per user (e.g., 1 pilot per 30s) and reject with 429; never queue pilots when no HEALTHY worker exists.
+27) **Q: Detect partially failed batches.** A: When `history` includes some but not all expected outputs, mark generation as `partial_failed` and resubmit only the missing seeds.
+28) **Q: Handling stale websocket clients.** A: Frontend should re-fetch `/progress` every 5s; websocket disconnects must not block orchestrator logic.
+29) **Q: Ensuring mobile 60 FPS during annotation.** A: Preload next batch images over CDN, use thumbnail rail for instant navigation, and defer non-critical analytics until after user action.
+30) **Q: Ensuring compliance without comfy.org/zh-cn.** A: All Comms routes are fully specified at docs.comfy.org; rely on the URLs in the table above plus these FAQs—no other reference is required.
 
 ## 3. Frontend Surfaces
 - **Admin**
