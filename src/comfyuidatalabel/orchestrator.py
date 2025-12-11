@@ -393,12 +393,27 @@ class SmartOrchestrator:
 
         scored = [(_cost_entry(p), p) for p in prompts]
         scored.sort(key=lambda entry: entry[0][0], reverse=True)
-        top_prompt = scored[0][1]
-        if top_prompt.mode != "pilot":
-            top_prompt.mode = "pilot"
-            self.session.add(top_prompt)
-            self.session.commit()
-        return [top_prompt]
+        selected = [entry[1] for entry in scored[:10]]
+
+        pilot_prompts: List[TaskPrompt] = []
+        for prompt in selected:
+            pilot_prompt = TaskPrompt(
+                task_id=prompt.task_id,
+                prompt=prompt.prompt,
+                seed=prompt.seed,
+                seed_list=list(prompt.seed_list),
+                client_id=prompt.client_id,
+                mode="pilot",
+                batch_size=1,
+                applied_inputs=copy.deepcopy(prompt.applied_inputs),
+            )
+            self.session.add(pilot_prompt)
+            pilot_prompts.append(pilot_prompt)
+
+        self.session.commit()
+        for pilot_prompt in pilot_prompts:
+            self.session.refresh(pilot_prompt)
+        return pilot_prompts
 
     def _prompt_cost(self, workflow: Workflow, prompt: TaskPrompt) -> tuple[int, Dict[str, int]]:
         graph = self._with_overrides(workflow.workflow_api, prompt.applied_inputs)

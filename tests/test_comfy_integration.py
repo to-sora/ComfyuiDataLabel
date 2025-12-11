@@ -83,8 +83,9 @@ def test_orchestrator_hits_comfy_stub():
         pilot_jobs = orchestrator.run_pilot(task.id)
         assert pilot_jobs[0]["prompt_id"].startswith("job-")
         orchestrator.freeze_task(task.id)
+        mass_prompts = [p for p in task.prompts if p.mode == "mass"]
         mass_jobs = orchestrator.generate(task.id)
-        assert len(mass_jobs) == len(task.prompts) - len(pilot_jobs)
+        assert len(mass_jobs) == len(mass_prompts)
 
 
 def test_no_workers_available():
