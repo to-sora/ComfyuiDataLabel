@@ -78,7 +78,7 @@
 | --- | --- | --- | --- | --- |
 | `/prompt` | `POST` | 提交工作流。请求体为 `workflow_api.json`（可附加 `client_id`）。返回 `prompt_id`。| 请求体：`client_id`、`prompt`。响应：`{ prompt_id }`。| https://docs.comfy.org/zh-Hans/automation/api#post-prompt |
 | `/history/{prompt_id}` | `GET` | 轮询任务状态与输出（图像文件名、子目录）。 | 响应：`{ prompt: {}, outputs: {"<nodeId>": { images: [{filename, subfolder, type}]}}}`。| https://docs.comfy.org/zh-Hans/automation/api#get-historyprompt_id |
-| `/queue` | `GET` | 查看待处理/运行中的队列长度。 | 响应：`{ pending, running, queue_running }`。| https://docs.comfy.org/zh-Hans/automation/api#get-queue |
+| `/queue` | `GET` | 查看待处理/运行中的队列长度。 | 响应包含 `queue_pending`、`queue_running` 列表，用于呈现等待与执行中的任务。| https://docs.comfy.org/zh-Hans/automation/api#get-queue |
 | `/interrupt` | `POST` | 中断当前运行。 | 响应：`{ success: true }`。| https://docs.comfy.org/zh-Hans/automation/api#post-interrupt |
 | `/free` | `POST` | 释放显存。 | 响应：`{ success: true }`。| https://docs.comfy.org/zh-Hans/automation/api#post-free |
 | `/system_stats` | `GET` | GPU/CPU/内存统计，适合健康检查。 | 响应：`{ system: { ram_total, ram_used, vram_total, vram_used, cuda_devices[] } }`。| https://docs.comfy.org/zh-Hans/automation/api#get-system_stats |

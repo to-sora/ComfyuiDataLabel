@@ -16,8 +16,8 @@
     • 行動優先但資訊量大。 您希望在 6 吋手機上提供 A/B/N 張對比標註。若一次需比較 8 張圖，手機版逐一切換會降低效率。此外，Zoom 功能若實作不佳可能產生延遲。建議在手機端提供「最佳快照縮圖列」與「雙指放大」結合的標註介面，並支援在桌機版一次顯示多張圖以提高效率。
     • 社群標籤管理。 公開任務池允許依標籤挑選任務，但標籤來源不明且易失真。建議預先定義標籤集合，並讓任務創建者選擇合適標籤，以利標註者根據興趣篩選。
 5 彈性拓展與升級
-    • V3 Schema 遷移。 ComfyUI 2025 年後大部分節點已遷移至 V3 Schema，並新增許多 API 節點[5]。若 workflow 使用舊版節點，未來升級可能導致相容性問題。平台應提供節點版本檢測工具，在匯入 workflow 時提醒使用者升級至 V3。
-    • 新模型支援。 ComfyUI 0.4.0 版本於 2025‑12‑10 發布，新增 Ovis Image、Kandinsky 5.0 等模型及各種性能優化[6]。系統應考慮可插拔的模型管理，不僅局限於 SD1.5 或 SDXL。
+    • V3 Schema 遷移。 ComfyUI 官方正推行 V3 Schema，許多節點已逐步過渡；若 workflow 使用較舊的節點定義，未來升級可能導致相容性問題。平台應提供節點版本檢測工具，在匯入 workflow 時提醒使用者升級至 V3。
+    • 新模型支援。 需持續關注 ComfyUI 的版本更新與新模型支援狀態，採用可插拔的模型管理設計，避免僅局限於 SD1.5 或 SDXL。
 修訂後的系統需求
 以下根據上述分析對原 SRS 進行修訂與補充。若未提及即沿用原有描述。
 1 引言
@@ -27,7 +27,7 @@
     2. 前端（Admin／User UI） – 管理 workflow 上傳與配置；提交生成任務；標註圖片。
     3. 後端調度層（Smart Orchestrator） – 管理任務生命週期，與 ComfyUI API 通訊，控制佇列長度及重試；處理 GPU OOM 和種子管理。
     4. 生成引擎（ComfyUI Worker） – 負責載入模型，執行 workflow，回傳生成圖片與 metadata。
-    5. 佇列與執行模型： 後端調度層使用 /prompt POST 將 prompt 提交至 ComfyUI 佇列[7]；透過 /prompt GET 或 /queue GET 監控執行狀態[3]。調度器維持 ComfyUI 佇列長度≤2，透過 /queue POST 清除 pending/running 或 /interrupt POST 中斷當前工作以處理高優先度任務。
+    5. 佇列與執行模型： 後端調度層使用 /prompt POST 將 prompt 提交至 ComfyUI 佇列[7]；透過 /prompt GET 或 /queue GET 監控執行狀態[3]。調度器維持 ComfyUI 佇列長度≤2，透過 /queue POST 清除 queue_pending/queue_running 或 /interrupt POST 中斷當前工作以處理高優先度任務。
     6. 種子控制： Workflow 應加入 LatentBatchSeedBehavior 節點（或等效自訂節點），允許在批次中指定每張圖的 seed 或設定為「隨機種子」模式，避免批次生成的圖片種子遞增問題[4]。後端在試產及 Freeze 後把實際使用的 seed 寫入資料庫以便重現。
 3 功能需求
 3.1 Admin 模組 – Workflow 與變數池管理
@@ -151,7 +151,7 @@ A ComfyUI API 操作
     2. POST /prompt – 送出 workflow JSON 以排入執行佇列，回傳 prompt_id 與佇列位置[7]。
     3. GET /prompt – 查詢當前佇列與執行狀態，包含當前執行的 prompt 及錯誤訊息[3]。
     4. GET /queue – 查看待處理和執行中的任務清單，用於控制提交節奏[3]。
-    5. POST /queue – 管理佇列，可清除 pending/running 任務；可用於插隊或取消。
+    5. POST /queue – 管理佇列，可清除 queue_pending/queue_running 任務；可用於插隊或取消。
     6. POST /interrupt – 立即停止目前正在執行的 workflow[3]。
     7. GET /history – 查詢已完成或失敗的 prompt 歷史。
     8. WebSocket /ws – 實時取得進度與節點執行狀態更新[8]。
@@ -176,14 +176,14 @@ def submit_prompt(workflow_data: dict, client_id: str = "hil-agent") -> tuple[st
 prompt_id, position = submit_prompt(modified_workflow)
 print(f"Submitted prompt {prompt_id} at queue position {position}")
     1. 佇列監控與等待：
-AI 代理需在提交每個新任務前確認 ComfyUI 佇列深度不超過安全閾值。下方函式透過輪詢 /queue 來監控當前 pending/running 任務數，直到低於指定閾值後才返回：
+AI 代理需在提交每個新任務前確認 ComfyUI 佇列深度不超過安全閾值。下方函式透過輪詢 /queue 來監控當前 queue_pending/queue_running 任務數，直到低於指定閾值後才返回：
 import time
 
 def wait_until_queue_below(limit: int) -> None:
     while True:
         q = requests.get(f"{BASE_URL}/queue").json()
-        pending = q.get("pending", [])
-        running = q.get("running", [])
+        pending = q.get("queue_pending", [])
+        running = q.get("queue_running", [])
         if len(pending) + len(running) < limit:
             break
         time.sleep(0.5)
@@ -340,11 +340,10 @@ H ComfyUI API 請求／回應結構詳解
     4. GET /queue – 查詢佇列狀態
     5. 回應範例：
     • {
-  "queue_remaining": 1,
-  "pending": ["8e54c8f6-..."],
-  "running": ["9455b5b2-..."]
+  "queue_pending": ["8e54c8f6-..."],
+  "queue_running": ["9455b5b2-..."]
 }
-    6. queue_remaining 表示待處理條數，pending 列出待執行 prompt_id，running 列出正在執行的 prompt_id[9]。
+    6. queue_pending 列出待執行的 prompt_id，queue_running 列出正在執行的 prompt_id[9]。
     7. GET /history/{prompt_id} – 查詢歷史結果
     8. 成功生成後，可透過此端點取得輸出資訊。
     9. 回應包含每個節點的輸出，對於 SaveImage 節點會有 filename 和 subfolder，需組合出圖片路徑，如 output/images/filename.png。
@@ -355,7 +354,7 @@ ComfyUI 在 workflow 驗證與執行階段可能產生錯誤。AI 代理應根
     1. 驗證錯誤： 提交 /prompt 時若 workflow 結構不合法，回應將包含 error 與 node_errors。應立即中止該任務，記錄錯誤並通知開發者修正 workflow。
     2. 資源不足（OOM）： 在執行時會透過 WebSocket execution_error 消息提醒，或在 /prompt 回應中帶 error，內容可能出現 OutOfMemory。建議將 batch_size 減半或降低解析度後重試。
     3. 模型缺失或路徑錯誤： 若 workflow 指定了不存在的模型或檔案，會在驗證階段即報錯。請確保 models/{folder} 端點回傳的模型列表中包含所需模型[10]。
-    4. 佇列滿載： 若 /queue 回傳 queue_remaining 大於允許值，表示伺服器忙碌；調度器應稍後再提交。
+    4. 佇列滿載： 若 /queue 回傳的 queue_pending 長度超過允許值，表示伺服器忙碌；調度器應稍後再提交。
     5. 自訂節點失敗： WebSocket 會發送 execution_error 並指出出錯的 node_type[11]。除非邏輯錯誤被修正，否則不應重試。
 J 前端介面設計具體指南
 以下列出前端開發時應遵循的具體規範，以減少界面設計時的自由度：
@@ -370,7 +369,7 @@ K 測試計畫與品質保證
     3. 壓力測試： 使用工具（如 Locust）模擬多用戶同時提交任務與標註，檢測佇列管理與資料庫性能。目標是在 GPU 處理能力允許範圍內保持接口響應時間 < 1 秒。
     4. 回歸測試： ComfyUI 每次升級前執行舊版 workflow，確保產出與 metadata 格式仍然一致。若有重大版本更新（例如 v0.4 → v0.5），在測試環境上先驗證相容性再升級正式環境。
 L 安全與 API 金鑰管理
-    1. 使用者驗證： 若將 ComfyUI 部署為共享服務，建議啟用 API 金鑰以限制 API 節點存取。官方文件指出，自 2025 年起可以透過 extra_data.api_key_comfy_org 在提交 payload 時傳遞 ComfyUI Platform 的金鑰[12]。代理應從安全儲存（如環境變量或密鑰管理服務）讀取金鑰，並加入 extra_data。
+    1. 使用者驗證： 若將 ComfyUI 部署為共享服務，建議啟用 API 金鑰以限制 API 節點存取。官方文件指出，可以透過 extra_data.api_key_comfy_org 在提交 payload 時傳遞 ComfyUI Platform 的金鑰[12]。代理應從安全儲存（如環境變量或密鑰管理服務）讀取金鑰，並加入 extra_data。
     2. 敏感資料保護： 所有包含種子和 Prompt 的資料庫表需設置適當權限，僅允許後端服務帳號讀寫。禁止前端直接存取種子列表。
     3. 網路安全： 建議在服務與 ComfyUI 之間啟用 TLS；若使用公有雲儲存圖片，需設置適當的存取權限（例如 S3 pre‑signed URL）。
 M 系統架構圖
