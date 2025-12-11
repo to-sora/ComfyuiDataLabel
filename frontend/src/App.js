@@ -1,11 +1,28 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { BrowserRouter as Router, Route, Routes, Link, useParams } from 'react-router-dom';
+import WorkflowUpload from './components/WorkflowUpload';
+import TaskCreate from './components/TaskCreate';
+import VariablePoolCreate from './components/VariablePoolCreate';
 import './App.css';
 
 const API_BASE = 'http://localhost:8000/api';
 
 // --- Components ---
+
+function AdminDashboard() {
+    return (
+        <div>
+            <h2>Admin Dashboard</h2>
+            <div style={{display: "flex", gap: "20px", flexWrap: "wrap"}}>
+                <WorkerList />
+                <VariablePoolCreate />
+                <WorkflowUpload />
+                <TaskCreate />
+            </div>
+        </div>
+    );
+}
 
 function WorkerList() {
   const [workers, setWorkers] = useState([]);
@@ -154,11 +171,11 @@ function App() {
         <header className="App-header">
           <h1>ComfyUI Data Labeling</h1>
           <nav>
-            <Link to="/">Workers</Link> | <Link to="/tasks">Tasks</Link>
+            <Link to="/">Admin</Link> | <Link to="/tasks">Tasks</Link>
           </nav>
         </header>
         <Routes>
-          <Route path="/" element={<WorkerList />} />
+          <Route path="/" element={<AdminDashboard />} />
           <Route path="/tasks" element={<TaskList />} />
           <Route path="/annotate/:taskId" element={<AnnotationWorkbench />} />
         </Routes>

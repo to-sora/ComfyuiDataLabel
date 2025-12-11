@@ -2,11 +2,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.models.base import engine, Base
 from backend.app.api import workers, workflows, variable_pools, tasks, annotations, exports
+from backend.app.services.health_monitor import start_health_monitor, stop_health_monitor
+from contextlib import asynccontextmanager
 
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ComfyUI Data Labeling Platform")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_health_monitor()
+    yield
+    stop_health_monitor()
+
+app = FastAPI(title="ComfyUI Data Labeling Platform", lifespan=lifespan)
 
 # CORS
 app.add_middleware(
