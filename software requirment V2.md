@@ -1,436 +1,462 @@
-人類回饋資料整備平台 Version 2– 系統需求與開發建議
-專案概述
-本專案旨在建立一套符合 IEEE 830 標準的 人類回饋資料整備平台（Human‑in‑the‑loop Data‑Curation Platform），目標是高效生成並標註用於直接偏好最佳化（DPO）與 RLHF 的圖像資料集。系統整合 Stable Diffusion 生圖流程（透過 ComfyUI 伺服器）與標註工作台，提供從「批量生成」到「人工標註」的一站式工作流程。
-在整理用戶提供的 v2.1 版 SRS 時，發現若干問題與潛在風險。這些問題主要涉及 ComfyUI API 的相容性、批次生成的種子控制、佇列管理以及用戶體驗。以下先對這些問題作出分析，並引用官方文件來說明原因，再給出修訂後的需求與開發指引。
-潛在問題分析
-1 ComfyUI API 與佇列管理
-    • 佇列 API 行為變更。 官方文件指出，ComfyUI 伺服器的核心 API 包含 /prompt（提交 Prompt 到執行佇列）與 /queue（讀取或管理佇列）等端點[1]。您的 SRS 中假設後端可以將數百個請求同時塞入 ComfyUI 佇列，並只依靠 ComfyUI 自身的效能來排列工作。但新版 ComfyUI 已限制單次佇列新增數量，並提供 batch count limit 設定以避免一次排入過多作業。若在短時間內提交大量請求，可能導致伺服器拒絕請求或 UI 無法回應。因而必須在外層實作佇列管理，定期透過 /queue 監視佇列長度並控制提交速率。
-    • 狀態同步。 /prompt 端點返回 prompt_id 及在佇列中的位置[2]。舊版 API 直接以回傳順序即為執行順序，新版 ComfyUI 支援取消佇列 (/queue POST) 和中斷執行 (/interrupt)[3]。因此後端必須處理取消與重試，並實現狀態機以應對 OOM 或其他錯誤。
-2 批次生成與種子控制
-    • 種子不唯一。 根據 ComfyUI 使用者分享，當在同一個批次中生成多張圖片時，所有圖像的隨機性均來自同一個基準 seed；每張圖像的 seed 為基準 seed 的遞增值[4]。這與 SRS 中「內層迴圈批次生成 N 張圖，每張圖只種子不同」的假設不同：ComfyUI API 目前無法直接指定多個 seed，除非借助自訂節點（例如 LatentBatchSeedBehavior）調整種子行為。若不處理，可能導致產生的 N 張圖之間相關性過高，影響 DPO 標註效果。
-    • 種子紀錄。 為了保證試產與 Freeze 之後的可重現性，必須知道每一張圖的 seed。然而當使用批次生圖時，ComfyUI 只回報起始 seed，後續 seed 需要推算 start_seed + index。若流程中任何節點動態改變 seed（例如 KSamplerAdvanced 的 control_after_generate），就無法準確推算。因此需明確規範在 workflow 中僅使用固定 seed 行為，或者透過 LatentBatchSeedBehavior 將 batch 隨機種子寫回 metadata。
-3 變數池採樣與資料一致性
-    • 組合爆炸與重複。 SRS 中建議由系統隨機從「服裝」、「光影」等變數池組合出 1000 個 Prompt。若變數池很大但任務量有限，純隨機採樣可能出現重複組合。建議提供「排列組合模式」與「無放回隨機抽樣模式」，並在 Freeze 時將實際抽樣結果保存，避免後續重複。
-    • Prompt 整合時的語法問題。 若變數池中包含中英文混雜或特殊符號，拼接 Prompt 時需注意逗號、空格等分隔符，避免生成語法錯誤的 Prompt。
-4 標註介面與使用者體驗
-    • 行動優先但資訊量大。 您希望在 6 吋手機上提供 A/B/N 張對比標註。若一次需比較 8 張圖，手機版逐一切換會降低效率。此外，Zoom 功能若實作不佳可能產生延遲。建議在手機端提供「最佳快照縮圖列」與「雙指放大」結合的標註介面，並支援在桌機版一次顯示多張圖以提高效率。
-    • 社群標籤管理。 公開任務池允許依標籤挑選任務，但標籤來源不明且易失真。建議預先定義標籤集合，並讓任務創建者選擇合適標籤，以利標註者根據興趣篩選。
-5 彈性拓展與升級
-    • V3 Schema 遷移。 ComfyUI 2025 年後大部分節點已遷移至 V3 Schema，並新增許多 API 節點[5]。若 workflow 使用舊版節點，未來升級可能導致相容性問題。平台應提供節點版本檢測工具，在匯入 workflow 時提醒使用者升級至 V3。
-    • 新模型支援。 ComfyUI 0.4.0 版本於 2025‑12‑10 發布，新增 Ovis Image、Kandinsky 5.0 等模型及各種性能優化[6]。系統應考慮可插拔的模型管理，不僅局限於 SD1.5 或 SDXL。
-修訂後的系統需求
-以下根據上述分析對原 SRS 進行修訂與補充。若未提及即沿用原有描述。
-1 引言
-平台旨在建立從批量生成、試產檢測到人工標註的完整管線，主要解決 GPU 資源管理、資料一致性、種子追蹤及標註效率問題。
-2 整體描述
-    1. 架構概觀： 平台包含三層：
-    2. 前端（Admin／User UI） – 管理 workflow 上傳與配置；提交生成任務；標註圖片。
-    3. 後端調度層（Smart Orchestrator） – 管理任務生命週期，與 ComfyUI API 通訊，控制佇列長度及重試；處理 GPU OOM 和種子管理。
-    4. 生成引擎（ComfyUI Worker） – 負責載入模型，執行 workflow，回傳生成圖片與 metadata。
-    5. 佇列與執行模型： 後端調度層使用 /prompt POST 將 prompt 提交至 ComfyUI 佇列[7]；透過 /prompt GET 或 /queue GET 監控執行狀態[3]。調度器維持 ComfyUI 佇列長度≤2，透過 /queue POST 清除 pending/running 或 /interrupt POST 中斷當前工作以處理高優先度任務。
-    6. 種子控制： Workflow 應加入 LatentBatchSeedBehavior 節點（或等效自訂節點），允許在批次中指定每張圖的 seed 或設定為「隨機種子」模式，避免批次生成的圖片種子遞增問題[4]。後端在試產及 Freeze 後把實際使用的 seed 寫入資料庫以便重現。
-3 功能需求
-3.1 Admin 模組 – Workflow 與變數池管理
-    1. Workflow 上傳與限制設定： Admin 上傳 workflow_api.json 時，需要：
-    2. 指定 Max_Workflow_Batch_Size（根據模型與 VRAM，建議 SDXL 為 4，SD1.5 為 8）。
-    3. 標記哪些 Input Node 對應系統變數（prompt、seed 等）。
-    4. 提供 workflow 所用節點的 Schema 版本，若檢測到舊版 V2 節點，提示升級。
-    5. 變數池管理：
-    6. 支援建立多種類別變數池（服裝、光影、角色等），並記錄其內容與版本。
-    7. 提供「無放回隨機抽樣」與「排列組合」模式，避免生成任務中出現重複組合。
-    8. 抽樣時生成對應的 Prompt 字串，需自動處理分隔符，避免 Prompt 語法錯誤。
-3.2 User 模組 – 任務配置、試產與鎖定
-    1. 任務配置： User 選擇 Workflow 和變數池後輸入目標組數 K（例如 1000 組），系統根據抽樣模式生成 K 個獨特的 Prompt 並為每組設定批次中圖片數 N（預設 2, 4 或 8）。後端利用 LatentBatchSeedBehavior 或類似機制為每張圖分配獨立 seed。
-    2. 試產階段： 提交批次任務前，調度器選擇最可能觸發 OOM 的參數組合（最大解析度、最多 ControlNet 等），利用 /prompt 提交一個測試 batch 並監測是否 OOM。如失敗自動降低解析度或 batch size 重試（最大重試 3 次）。試產成功後產出一小部分樣本（例如 10 組）供 User 確認。
-    3. 鎖定（Freeze）機制：
-    4. User 審核試產樣本後點擊「鎖定」，系統將實際抽樣到的 Prompt 列表、每張圖的 seed、用於 workflow 的參數快照等寫入資料庫，任務狀態變為 FROZEN。
-    5. 再執行批次生圖時禁止更改任何動態參數；若需修改需重新開始新的任務與試產流程。
-3.3 後端模組 – 智慧調度與錯誤恢復
-    1. 雙層調度策略：
-    2. 外層迴圈（Prompt 層）： 針對每個 Prompt 建立一個任務物件，依序使用 /prompt 提交給 ComfyUI。調度器在提交前檢查 /queue 是否低於安全閾值，否則等待；每次提交後記錄 prompt_id 用於追蹤。
-    3. 內層迴圈（Batch 層）： 在 workflow 中設定 batch_size = N，並透過 LatentBatchSeedBehavior 讓每張圖使用獨立 seed。利用 GPU SIMD 一次生成 N 張圖，可選擇 batch_count > 1 以重複運行多次。
-    4. 錯誤處理與隔離：
-    5. 若某個 Prompt 生成失敗或遭安全過濾器攔截，調度器將該 batch 標記為 FAILED 並記錄錯誤，不影響其他任務。
-    6. 若 ComfyUI 出現 OOM 或進程崩潰，調度器可呼叫 /interrupt 中斷執行，再使用 /free 卸載模型後重新提交失敗的任務（重試上限 3 次）。
-3.4 標註工作台 – Mobile First
-    1. 資料呈現： 標註頁面在手機版中採用單圖模式，提供左右滑動快速切換，並在底部顯示小縮圖列方便跳轉；桌機版可提供網格模式一次檢視多張圖。
-    2. 標註邏輯：
-    3. 選擇最佳（Chosen）： 用戶在 N 張圖中選出一張最符合偏好的圖。
-    4. 標記次差（Rejected）： 可選，選出一張最差的圖。
-    5. 垃圾標記（Spam）： 若 N 張圖全數無法使用，點擊垃圾按鈕，系統標記整組為 spam，對應的圖像不入資料集。
-    6. 系統需保證選出的 chosen 與 rejected 的 Prompt 完全一致，僅 seed 不同。
-    7. 社群任務池： 為避免任務來源不明，僅允許標註者根據預定義標籤篩選公開任務；新增任務時須選擇標籤。
-4 資料需求
-    1. DPO 輸出格式（JSONL）： 每一行包含 prompt、chosen（圖片路徑）、rejected（圖片路徑或 null）、seeds（包含 chosen/rejected 的種子）以及 metadata（模型名、batch_size、變數池版本等）。
-    2. 圖片儲存： 生成後立即將圖片從 ComfyUI 的暫存目錄轉存至永久儲存（如 S3 或 NAS），並將路徑寫入資料庫。禁止依賴 /temp 或 /output 目錄持久保存。
-5 非功能需求
-    1. 可靠性：
-    2. 後端須實作監控程序，若 ComfyUI 進程異常終止，能自動重啟並恢復佇列。
-    3. 每個 Prompt 任務重試次數不得超過 3 次；若多次失敗需人工介入。
-    4. 效能：
-    5. 調度器維持 ComfyUI 佇列中最多 1 至 2 個待執行工作，利用 /queue GET 監控[3]。
-    6. 支持多 GPU 集群，可根據 GPU 空閒狀態動態分配任務。
-    7. 使用者體驗：
-    8. 標註介面支援離線瀏覽與預取，降低載入時間。
-    9. 在手機端使用固定底部工具列，確保拇指操作友好；在桌機端顯示快捷鍵提示。
-6 開發指引與實作建議
-    1. ComfyUI API 封裝： 建立一層與 ComfyUI 通訊的服務，封裝 /prompt、/queue、/history、/interrupt 等 API[3]。此服務應支持：
-    2. 佇列長度檢查與排隊等待。
-    3. 自動重連 WebSocket (/ws) 以接收進度與錯誤[8]。
-    4. 請求超時與錯誤重試。
-    5. 種子管理： 在 workflow 中加入 LatentBatchSeedBehavior 或同等自訂節點，用於控制批次內種子分配（隨機或固定）並在輸出元資料中回傳 seeds。若無法使用，自行在後端生成每個圖像的 seed，並將 batch_size 設為 1，改由 batch_count 控制生圖數量（效能較低但可確保每張圖 seed 可控）。
-    6. 佇列調度策略：
-    7. 後端調度器維護內部任務佇列，每次從佇列取出一個 Prompt 任務，檢查 ComfyUI 佇列長度（透過 /queue GET），若小於設定值則提交；否則等待。這樣可防止瞬間排入大量任務導致 UI 卡死。
-    8. 實作優先級隊列，高優任務（試產、快速迭代）可插隊。
-    9. 試產與 OOM 預測： 透過分析 workflow 中的解析度、 ControlNet 數量、所載模型大小等指標預估 VRAM 使用；試產階段先生成資源佔用最大的組合。根據 ComfyUI 回傳的錯誤資訊調整 batch_size 或關閉部分功能重試。
-    10. 持續整合與升級：
-    11. 定期關注 ComfyUI 更新日誌，特別是重大版本（v0.4.0 之後）對 API 或節點的變更[5]。
-    12. 在開發與部署時鎖定 ComfyUI 版本，並在升級前於測試環境驗證所有 workflow。
-7 整體架構流程圖
-以下以簡化的文字流程圖描述系統工作流程。方括號表示模組，箭頭表示資料或控制流。
-┌─────────────┐      ┌─────────────────────┐      ┌───────────────────┐
-│ Admin UI   │      │ Smart Orchestrator │      │ ComfyUI Worker    │
-│ (workflow  │      │ (Backend)          │      │ (SD generation)   │
-└──────┬──────┘      └──────────┬──────────┘      └─────────┬──────────┘
-       │ Upload workflow & variables        │                    │
-       │ set Max_Workflow_Batch_Size        │                    │
-       │ define variable pools              │                    │
-       ▼                                     │                    │
-┌─────────────┐                               │                    │
-│ User UI    │                               │                    │
-│ (task cfg  │                               │                    │
-└──────┬──────┘                               │                    │
-       │ Select workflow & pools             │                    │
-       │ Input number of prompt combos (K)   │                    │
-       ▼                                     │                    │
-  generate K prompts with seeds              │                    │
-       │                                     ▼                    │
-       │                            [Pilot Run & OOM check]      │
-       │                             ├─ run heavy params → /prompt
-       │                             ├─ monitor /prompt & /queue
-       │                             └─ produce sample images
-       │                                     │                    │
-       │<───── present samples to user ──────┘                    │
-       │ User approves & Freeze             │                    │
-       │ (store prompts & seeds)            │                    │
-       ▼                                     │                    │
- submit each prompt to orchestrator queue    │                    │
-       │                                     ▼                    │
-       │                         Outer loop: iterate prompts      │
-       │                         ├─ wait until ComfyUI queue      │
-       │                         │    length < limit               │
-       │                         ├─ set batch_size = N            │
-       │                         ├─ attach seeds via node         │
-       │                         └─ POST /prompt                  │
-       ▼                                     │                    ▼
-  save returned images & metadata             │        ComfyUI loads model
-       │                                     │        executes workflow,
-       │                                     │        returns images
-       ▼                                     │                    │
-┌─────────────────────┐                       │                    │
-│ Storage & Metadata │◄──────────────────────┘                    │
-└─────────┬──────────┘                                             │
-          │                                                      ▼
-          │                                    ┌─────────────────┐
-          │                                    │ Annotation      │
-          │                                    │ Workbench (UI)  │
-          │                                    └──────┬──────────┘
-          │                                           │
-          └───────────────── present N images per prompt
-                                              │
-                         User selects chosen/rejected/spam
-                                              │
-                                Generate DPO JSONL & export
-上述流程圖概述了整個管線：Admin 與 User 透過 Web UI 配置任務；後端調度器負責試產、凍結及發送請求給 ComfyUI；生成結果經儲存後進入標註階段，產生最終的 DPO 資料集。
-結論
-原始 SRS 已整合許多創新的設計（試產與鎖定協議、變數池抽樣、智慧調度及行動優先標註介面），但仍需注意 ComfyUI API 行為與 seed 控制方面的細節。透過本修訂，新增種子管理機制、佇列監控策略以及升級兼容性考量，可以降低執行風險並提升用戶體驗。開發團隊需根據最新的 ComfyUI 文檔進行實作與測試，並在系統設計中保持模組化與可擴充性，以便適應 Stable Diffusion 模型和 ComfyUI 生態的不斷演進。
-附錄：供 AI Coding Agent 使用的詳細指南
-為了減少後續由 AI 程式開發代理做決策的自由度，以下提供更具體的技術細節、範例流程和資料庫模式。這些內容可直接用於編程實作，幾乎不需要進一步推測。
-A ComfyUI API 操作
-    1. 核心端點一覽：
-    2. POST /prompt – 送出 workflow JSON 以排入執行佇列，回傳 prompt_id 與佇列位置[7]。
-    3. GET /prompt – 查詢當前佇列與執行狀態，包含當前執行的 prompt 及錯誤訊息[3]。
-    4. GET /queue – 查看待處理和執行中的任務清單，用於控制提交節奏[3]。
-    5. POST /queue – 管理佇列，可清除 pending/running 任務；可用於插隊或取消。
-    6. POST /interrupt – 立即停止目前正在執行的 workflow[3]。
-    7. GET /history – 查詢已完成或失敗的 prompt 歷史。
-    8. WebSocket /ws – 實時取得進度與節點執行狀態更新[8]。
-    9. 提交 workflow 的程式範例：
-以下 Python 函數將修改後的 workflow JSON 送到 /prompt，並回傳 prompt_id 與排隊位置。
-import requests
-import json
+Available Hardware:
+HDD * N (Unequal size), SDD *1 , Postgresql Database 
 
-BASE_URL = "http://localhost:8188"
+This project  should contain 3 system.
+S01 File manage system
+Handle multiple disk , io of file
+Handle optimization
+Provide endpoint on batch Read write and single read write. ( high level endpoint for task of other system.
+Ensure Copy_of_raw and rebuild when disk failure etc
+S02 Schelder system 
+A GUI system to start scheduler process of S03 S04 S07
+Do not contain business logic but just a scheldre system
+S03 Formatting and adapter system
+Handle different complex structure of different source
+Output an interface  to tell S05 to update without access to SQL database
+S04 Data cleaning and system.  ( core logic and gpu worker)
+Note S04 is run in other VM and have contain code that current running , ready for migration
+Each action contain specific input and output dir structure and not able to change
+S05 Database system
+Handle to interface to do io in SQL server
+Handle backup of SQL server
+Handle health and verify status of SQL server
+S06 Visualize system
+A simple Visualize of S05 
+S07 Dataset_generate system
+Invoke by S02
+Handle by core business logic
+Use S01 and S05 to write in TYPE 3D
+S08 testing system 
+Test in a other DB and also ensure different unit test of different script 
 
-def submit_prompt(workflow_data: dict, client_id: str = "hil-agent") -> tuple[str,int]:
-    payload = {
-        "prompt": workflow_data,
-        "client_id": client_id
-    }
-    resp = requests.post(f"{BASE_URL}/prompt", json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("prompt_id"), data.get("number", -1)
 
-# 用法示例：
-prompt_id, position = submit_prompt(modified_workflow)
-print(f"Submitted prompt {prompt_id} at queue position {position}")
-    1. 佇列監控與等待：
-AI 代理需在提交每個新任務前確認 ComfyUI 佇列深度不超過安全閾值。下方函式透過輪詢 /queue 來監控當前 pending/running 任務數，直到低於指定閾值後才返回：
-import time
 
-def wait_until_queue_below(limit: int) -> None:
-    while True:
-        q = requests.get(f"{BASE_URL}/queue").json()
-        pending = q.get("pending", [])
-        running = q.get("running", [])
-        if len(pending) + len(running) < limit:
-            break
-        time.sleep(0.5)
+DATA storage
+TYPE 1 : cold storage (enough for raw data) ( not involve in system consider amazon galacer block storage for storing)
+TYPE 2 : MAIN HDD storage ( a few second hand HDD with different size) (handle by S01) 
+TYPE 3 : CO working area SSD (1TB)( 3a 3b 3c 3d is 3 dir in same ssd with quota)
+	TYPE 3A : Input of Web scrapped data  (Handle by user)
+	TYPE 3B : Output of Web scrapped data (Handle by user)
+	TYPE 3C : other VM , node data handling (Direct use by S04 as io space)
+	TYPE 3D : output dataset (output by S07)
 
-# 範例：確保佇列中少於兩個任務再提交
-wait_until_queue_below(limit=2)
-    1. WebSocket 監聽進度：
-以下示例展示如何建立 WebSocket 連線以監聽 prompt 執行進度與節點狀態。實際環境中應使用非同步程式庫（如 websockets 或 aiohttp）實作，再根據收到的訊息更新資料庫或採取重試。這裏僅示意流程：
-import websockets
-import asyncio
-import json
+Functional Requirement.
+F_01 
+store target 2TB -3TB raw data , 3-4 TB generated data. (store in type 2)
+F_02 
+Handle complex web scraping data from 10-20 sources with meta structure. (handle by S_03)
+F_03
+Handle web scrapping that input in batch and which may repeat in content but have different meta data. Also need to identify parent and DAG relationships across different batches without accessing data of other batches 
+F_04.
+Handle human-in-loop label data , preprocess action and gpu labeled data and store in an easy management way.
+Action Contain few type  label as AC[0-5]
+AC1 :  input a batch of tabular data in sql and output tag by complicated filtering(save in SQL) , no copy of data required ( work in SQL space only)
+AC2 :  deterministic , no hyper parameter , need copy data (may include parent and child) to a working dir (type 3C)(worker by docker k8s or a *.py *.sh script). compute non intensive (CPU only)  
+AC3 :  deterministic , no hyper parameter , need copy data (may include parent and child) to a working dir (type 3C)(worker by docker k8s or a *.py *.sh script). compute  intensive ( wait gpu node awake)
+AC4:   deterministic , contain parameter , need copy data (may include parent and child) to a working dir (type 3C)(worker by docker k8s or a *.py *.sh script). compute  intensive ( wait gpu node awake), will generate child data ( crop resize canny)(with a maxim of scale in constant A4_scale)
+AC5:   Undeterministic Human label, notation (temperate store in type 3C)
 
-async def monitor_progress(prompt_id: str):
-    async with websockets.connect(f"ws://localhost:8188/ws") as ws:
-        async for message in ws:
-            data = json.loads(message)
-            if data.get("prompt_id") != prompt_id:
-                continue  # 只處理目標 prompt
-            # 根據 message["type"] 處理不同類型事件
-            if data["type"] == "executed" and data.get("node_id") == "end":
-                print(f"Prompt {prompt_id} finished")
-                break
-            elif data["type"] == "error":
-                print(f"Error executing {prompt_id}: {data.get('error')}" )
-                break
+Handle different media and data structure tree relationship such it can sort and handle by complicated query which across parent and their meta data as well as label
 
-# 使用範例：
-asyncio.run(monitor_progress(prompt_id))
-B 種子管理與 workflow 注入
-    1. 生成可控制的種子列表：
-    2. 對於每個 prompt，按 batch_size = N 產生 N 個隨機整數 seed。例如使用 random.randint(0, 2**32-1)。
-    3. 把這些 seed 保存到 task_prompts.seed_list 中，以便後續追蹤。
-    4. 修改 workflow 中的 seed 與 batch_size：
-    5. 遍歷 workflow JSON 的 nodes 陣列，找到類型為 KSampler 或 KSamplerAdvanced 的節點。
-    6. 將其 inputs.seed 設為第一個 seed，inputs.batch_size 設為 seeds 數量。
-    7. 若使用 LatentBatchSeedBehavior 節點，將 seed_behavior 設為 random 或 fixed 並將 seed 列表填入該節點的輸入。
-    8. 更新 workflow 完成後再提交。
-    9. 示例函式
-def inject_seeds_and_batch(workflow: dict, seeds: list[int]) -> dict:
-    for node in workflow["nodes"]:
-        if node.get("class_type") == "KSampler":
-            node["inputs"]["seed"] = seeds[0]  # 批次起始 seed
-            node["inputs"]["batch_size"] = len(seeds)
-        elif node.get("class_type") == "LatentBatchSeedBehavior":
-            node["inputs"]["seed_behavior"] = "random"
-            node["inputs"]["seed_list"] = seeds
-    return workflow
-C 試產與 OOM 管理詳述
-    1. VRAM 預估策略：
-    2. 在管理端建立一張表格或模型，記錄常用模型（如 SD1.5、SDXL、Flux）在不同解析度與 ControlNet 設定下的平均 VRAM 使用量。
-    3. 每次建立任務時，根據 workflow 中的輸入解析度、模型、ControlNet 數量初步預估 VRAM。若預估結果接近 GPU VRAM 上限，可限制 batch_size 或降解析度。
-    4. 試產流程：
-    5. 從所有 Prompt 中選擇最耗資源的組合（例如解析度最高且控制網最多），構建 workflow，batch_size 設為 1。
-    6. 調用 /prompt 執行試產，若返回 OOM 錯誤（通常可從 WebSocket error 訊息或 /prompt 的 error 欄位判斷），則減半解析度或關閉部分 ControlNet，直至能夠成功生成。
-    7. 試產成功後再用相同參數生成 10 組樣本，供使用者檢視並決定是否鎖定。
-D 佇列調度器詳細流程
-    1. 初始化內部佇列
-    2. 從資料庫讀取所有 status = FROZEN 的 task，為每個 Prompt 生成 seed_list 與 workflow。
-    3. 對每個 Prompt 建立一個內部任務物件，包括 prompt text、seed_list、重試次數等。
-    4. 執行循環
-    5. 步驟 1： 呼叫 wait_until_queue_below(limit) 確保 ComfyUI 佇列長度少於設定值（例如 2）。
-    6. 步驟 2： 從內部佇列取出下一個未提交的任務，通過 inject_seeds_and_batch 將 seed、batch_size 注入工作流。
-    7. 步驟 3： 調用 submit_prompt，取得 prompt_id 及位置，記錄在資料庫。
-    8. 步驟 4： 啟動進度監聽（WebSocket 或輪詢）。如在執行期間收到 error 或超過超時限制，立即調用 /interrupt 中止並將任務放回佇列，減少重試次數。
-    9. 步驟 5： 任務成功完成後，調用 /history/{prompt_id} 或利用 WebSocket 返回信息獲取圖片輸出路徑；將圖片移至永久儲存並更新 generated_images 表。
-    10. 步驟 6： 重複上述步驟直到全部 Prompt 處理完畢。
-    11. 錯誤與重試策略
-    12. 為每個 Prompt 設置 retries_remaining（建議 3）。
-    13. 遇到臨時錯誤（例如網路問題、OOM）時重試；遇到永久錯誤（如 Prompt 語法錯誤、模型缺失）則標記為失敗並記錄原因。
-E 標註工作台詳細規範
-    1. 圖片載入與緩存： 使用前端框架（例如 React 或 Vue）實作標註頁。當使用者打開某組 Prompt 時，前端利用 API 請求下載 N 張圖片；一旦使用者開始標註，提前預取下一組的圖片以減少等待時間。可使用瀏覽器的 Cache API 或 IndexedDB 快取已下載圖片。
-    2. 標註操作流程：
-    3. 每張圖片提供「查看大圖」、「旋轉/放大」等輔助功能，確保標註公平。
-    4. 用戶選擇最佳圖後，前端回傳 chosen_index（0 到 N-1）；若選擇 rejected_index，則同時回傳；若全數垃圾則回傳 spam = true。
-    5. 後端根據 index 對應種子和圖片路徑更新 task_prompts 表。
-    6. 桌機與手機介面： 桌機版可使用網格模式一次顯示 N 張圖，使用滑鼠點擊；手機版採用水平輪播配合底部縮圖列，並確保放大手勢流暢。
-F 資料庫模式範例
-建立關聯資料庫（例如 PostgreSQL 或 MySQL），包含以下表格：
-tasks
-欄位
-說明
-task_id (UUID)
-任務唯一標識
-workflow_id
-引用 Admin 上傳的 workflow
-num_prompts
-欲生成的 Prompt 組數
-status
-PENDING/PILOT/FROZEN/RUNNING/FAILED etc.
-created_at
-建立時間
-frozen_at
-Freeze 時間
-completed_at
-完成時間
-task_prompts
-欄位
-說明
-prompt_id (UUID)
-Prompt 唯一標識
-task_id
-所屬 task
-prompt_text
-完整 Prompt 字串
-seed_list (JSON)
-對應此 Prompt 的 seed 列表
-status
-QUEUED/RUNNING/FAILED/COMPLETED
-retries_remaining
-剩餘重試次數
-chosen_index
-標註選中的 index（0‑based）
-rejected_index
-標註最差的 index（可為 null）
-spam (boolean)
-此組是否被判定為垃圾
-generated_images
-欄位
-說明
-image_id (UUID)
-圖片唯一標識
-prompt_id
-對應 Prompt
-seed
-此圖片的種子
-image_path
-儲存路徑（相對於 Storage）
-created_at
-生成時間
-G 常見問題與對策
-    • workflow 格式變更： 使用一個中間層將 workflow 映射到內部結構，並在升級 ComfyUI 前於測試環境驗證舊 workflow 是否能正常解析。
-    • 自訂節點與 API 節點： 在匯入 workflow 時檢查是否包含需要額外 API Key 或未支援的 custom node。對於未支援的節點，阻止上傳或要求手動審核。
-    • 標註者速度差異： 可在資料庫層加入鎖定機制，允許多位標註者同時從公開任務池領取不同的 prompt，並以先回傳者為準。對於衝突標註可啟動二審流程。
-H ComfyUI API 請求／回應結構詳解
-為了避免 AI 代理在與 ComfyUI 服務交互時猜測回應格式，以下列出常用端點的請求範例與回應結構。這些範例來源於官方伺服器路由文件[9]。
-    1. POST /prompt – 提交 workflow
-    2. 請求範例：
-    • {
-  "prompt": {
-    "nodes": {
-      "1": {"class_type": "LoadCheckpoint", "inputs": {"ckpt_name": "SDXL_v1"}},
-      "2": {"class_type": "KSampler", "inputs": {"seed": 123456789, "steps": 30, "cfg": 7.5, "batch_size": 2}},
-      "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "1girl, red dress"}},
-      "4": {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": "test"}}
-    },
-    "extra_data": {}
-  },
-  "client_id": "hil-agent"
-}
-    3. 回應欄位：
-        ◦ prompt_id：伺服器分配的唯一識別碼。
-        ◦ number：排入佇列的位置（0 表示立即執行）。
-        ◦ error：若驗證失敗則回傳錯誤訊息，並在 node_errors 指出哪個 node 有問題。
-    4. GET /queue – 查詢佇列狀態
-    5. 回應範例：
-    • {
-  "queue_remaining": 1,
-  "pending": ["8e54c8f6-..."],
-  "running": ["9455b5b2-..."]
-}
-    6. queue_remaining 表示待處理條數，pending 列出待執行 prompt_id，running 列出正在執行的 prompt_id[9]。
-    7. GET /history/{prompt_id} – 查詢歷史結果
-    8. 成功生成後，可透過此端點取得輸出資訊。
-    9. 回應包含每個節點的輸出，對於 SaveImage 節點會有 filename 和 subfolder，需組合出圖片路徑，如 output/images/filename.png。
-    10. POST /interrupt – 中止執行
-    11. 將當前執行的 prompt 停止並返回成功訊息。建議在監測到錯誤或超時時調用。
-I 錯誤訊息與對應處理建議
-ComfyUI 在 workflow 驗證與執行階段可能產生錯誤。AI 代理應根據不同錯誤類型採取相應策略。
-    1. 驗證錯誤： 提交 /prompt 時若 workflow 結構不合法，回應將包含 error 與 node_errors。應立即中止該任務，記錄錯誤並通知開發者修正 workflow。
-    2. 資源不足（OOM）： 在執行時會透過 WebSocket execution_error 消息提醒，或在 /prompt 回應中帶 error，內容可能出現 OutOfMemory。建議將 batch_size 減半或降低解析度後重試。
-    3. 模型缺失或路徑錯誤： 若 workflow 指定了不存在的模型或檔案，會在驗證階段即報錯。請確保 models/{folder} 端點回傳的模型列表中包含所需模型[10]。
-    4. 佇列滿載： 若 /queue 回傳 queue_remaining 大於允許值，表示伺服器忙碌；調度器應稍後再提交。
-    5. 自訂節點失敗： WebSocket 會發送 execution_error 並指出出錯的 node_type[11]。除非邏輯錯誤被修正，否則不應重試。
-J 前端介面設計具體指南
-以下列出前端開發時應遵循的具體規範，以減少界面設計時的自由度：
-    1. 色彩與排版： 採用淺色系主題，主要文字顏色為深灰 (#333)，按鈕使用一致的高亮色（如藍色 #007aff）。
-    2. 按鈕與點擊區域： 手機端按鈕高度至少 44 px，寬度不小於螢幕寬度的一半，確保拇指容易點擊。
-    3. 圖片展示： 手機版採用水平輪播呈現 N 張圖；桌機版可用 2 × 2 或 3 × 2 網格呈現。每張縮圖下方顯示簡短標籤（例如「Seed 1」、「Seed 2」）。
-    4. 標註流程提示： 在標註頁面上方顯示步驟導航（例如「步驟 1/1000」），並使用進度條表示完成度；提供「返回上一組」按鈕以利修正。
-    5. 無障礙： 按鈕與標籤必須加上 aria-label，確保螢幕閱讀器可讀。色彩對比度需滿足 WCAG 2.1 AA 標準。
-K 測試計畫與品質保證
-    1. 單元測試： 針對 API 封裝層編寫測試，模擬 /prompt、/queue 等端點的回應與錯誤，確保調度器行為一致。
-    2. 整合測試： 在測試環境部署 ComfyUI 伺服器，測試整個流程（生成、鎖定、標註、導出），並驗證每張生成圖片的 seed 與 metadata 是否與資料庫一致。
-    3. 壓力測試： 使用工具（如 Locust）模擬多用戶同時提交任務與標註，檢測佇列管理與資料庫性能。目標是在 GPU 處理能力允許範圍內保持接口響應時間 < 1 秒。
-    4. 回歸測試： ComfyUI 每次升級前執行舊版 workflow，確保產出與 metadata 格式仍然一致。若有重大版本更新（例如 v0.4 → v0.5），在測試環境上先驗證相容性再升級正式環境。
-L 安全與 API 金鑰管理
-    1. 使用者驗證： 若將 ComfyUI 部署為共享服務，建議啟用 API 金鑰以限制 API 節點存取。官方文件指出，自 2025 年起可以透過 extra_data.api_key_comfy_org 在提交 payload 時傳遞 ComfyUI Platform 的金鑰[12]。代理應從安全儲存（如環境變量或密鑰管理服務）讀取金鑰，並加入 extra_data。
-    2. 敏感資料保護： 所有包含種子和 Prompt 的資料庫表需設置適當權限，僅允許後端服務帳號讀寫。禁止前端直接存取種子列表。
-    3. 網路安全： 建議在服務與 ComfyUI 之間啟用 TLS；若使用公有雲儲存圖片，需設置適當的存取權限（例如 S3 pre‑signed URL）。
-M 系統架構圖
-下圖展示整體人類回饋資料整備平台的架構，包含主要模組與流程。粗略分為前端層（Admin UI、User UI、Annotation Workbench）、後端層（Smart Orchestrator、資料庫／儲存）、生成引擎層（ComfyUI 伺服器）。圖中箭頭標示了工作流程：Admin 上傳 workflow、User 設定任務並啟動試產、調度器呼叫 /prompt 生成圖片並將結果存入儲存，標註工作台取得圖片進行偏好標註後匯出 DPO JSONL。
+F_05	
+Able to schedule different workers and work by batch.
+F_06
+Able generates a dataset  n with specific structure in dir by doing complicated query over different tree
+F_07	
+Use load balance to handle different HDDs to have best performance across different bandwidth. 
+F_08	
+Able to rebuild data in a new disk when disk failure. 
+F_09	
+Optimize batch IO by multiple copy and brandwidth of disk.(handle by S01)
 
-@startuml
 
-!define RECTANGLE class
+system constant :
+shard_size  : in MB
+batch_size  : in GB
+Copy_of_raw : 1-No of disk
+A4_scale : 10 time
 
-RECTANGLE "Admin UI" as Admin {
-}
 
-RECTANGLE "User UI" as User {
-}
 
-RECTANGLE "Smart Orchestrator\n(Backend)" as Orchestrator {
-}
+User Action flow
+UA_1 ( webscrap data write in)
+put web-scrapped data in SSD type 3a
+invoke S02 to start corresponding script ( base on webscrapped source and business logic) in S03.
+ensure process handle by S03
+calling S01 and S05 and do IO
+copy data to type 3B
+user copy the data from type 3B to type 1     
 
-RECTANGLE "ComfyUI Server" as Comfy {
-}
+UA_2 (start worker Process)
 
-RECTANGLE "Storage & DB" as Storage {
-}
+invoke S02 to start corresponding script ( base on webscrapped source and business logic) in S03, S02 also handle the workflow
+S03 handle the logic and submit request in IO by make use of S05 and S01 
+Ensure data copy to type 3c in specific format
+Invoke S04 to start process and save data
+Invoke S03 to do reformatting such S05 can write GPU / human label result 
+Invoke S01 again if it is action_04
 
-RECTANGLE "Annotation Workbench" as Workbench {
-}
+UA_3
 
-' --- Relationships ---
+Invoke S02 by UI
+Start corresponding S07 dataset logic
+Request S05 to get label and IO in type 3D
+Request S01 to do batch IO to type 3D
 
-' Admin interactions
-Admin --> Orchestrator : Upload workflow
-Orchestrator --> ComfyUI: ensure workflow exit in ComfyUI
-Admin --> Orchestrator : Upload variable pool
-Admin --> Orchestrator : Upload variable run
+Note
+I)    user should only input data to type3a and give a signal to system on format. we should assume user no IO after sending this signal
+II)   there are a few user systems. and the cleaning process is human in loop
+III)  SSD storage may be full, it should be managed by the system and show warning and limit export when  there is not enough space. It should maintain by more than 1 system
 
-' User interactions
-User --> Orchestrator : Trigger pilot run
-Orchestrator --> User : Pilot run results
+System principle
+1) text, metadata, human label, GPU label should store in a external data base system ( system should daily back up by export the data)
+2) use suitable method to manage the all small file by S01
+3) 2 type of deletion : type A, delete in database level. type b delete a batch at once ( more than 0 shard level)
+4) TYPE2 , there will be HDD but not run in raid. system should do load balance on each mount HDD endpoint. The load balance is also done during export dataset to type 3D and type3C for other vm to work. The HDD load balance need to save multiple copy of raw data to prevent disk failure.
+5) batch is above of file system level, batch as tag  type of data is group by something
 
-' Orchestrator triggers
-User --> Workbench : Configure tasks
-Orchestrator --> Workbench : Trigger mass generation
+load balance policy
+1) if any disk fail, warn user
+2) ensure load balance of different HDD in batch IO , minimize seek time of each HDD and allow reorder of IO to make batch IO and copy to max average efficiency
+DATA copy policy
+0) type 3a3b3c3d is 4 dir in the same ssd partition, each expected a quota for each dir.
 
-' Backend → ComfyUI
-Orchestrator --> Comfy : Send /prompt (POST)
 
-' ComfyUI → Storage
-Comfy --> Storage : Generate images
+—
+Database_schema ver 3
 
-@enduml
+Tabel_00 
+Node_id | sha256 | is_vitral | is_physical
 
-這些詳細指南將可大幅降低 AI 程式開發代理需要做出的推斷與決策量，並為每一步提供具體的 API 呼叫、資料結構與處理邏輯。
+Tabel_01A Physical content
+Record_id | node_id | file_size  | create_time | in_black_list | is_delete | file_extension_id 
 
-[1] [2] [3] [7] [8] [9] [10] Routes - ComfyUI
-https://docs.comfy.org/development/comfyui-server/comms_routes
-[4] ComfyUI : Isolating An Image From a Batch | by YushanT7 | Medium
-https://medium.com/@yushantripleseven/comfyui-isolating-an-image-from-a-batch-7062f275c113
-[5] [6] Changelog - ComfyUI
-https://docs.comfy.org/changelog
-[11] Messages - ComfyUI
-https://docs.comfy.org/development/comfyui-server/comms_messages
-[12] ComfyUI Account API Key Integration - ComfyUI
-https://docs.comfy.org/development/comfyui-server/api-key-integration
+Tabel_01B Physical content
+Record_id | filepath 
+( consider a string for rebuild an locate resource if all disk failure>S01 recoverability non daily use , use as backup such allow non normalization)
+
+tabel : 03 : filetype_mapping
+file_extension_id | file_extension | type 
+1  , jpg , image
+2  , png , image
+
+# note this tabel only for video image sound and txt , not inculde exe binary 3d object zip tar all other format of data
+
+tabel 05 : source_tabel_mapping 
+
+source_ID | description | meta_tabel_NAME (allowed value is tabel name of tabel 07 series)
+1,twitter scrape by api | AOTHER TABEL NAME
+2,facebook scrape by api | AOTHER TABEL NAME
+
+—
+tabel 6 vitral_asset_description
+record_id | vitral_asset_description | Node_id 
+1|vitral_asset:description|01
+Sha256 of table 0 of virtual asset is come from this description ( this description is in special format
+
+
+
+
+# source_id map to table 4
+# Note batch id is not equal to action batch id
+# is_root mean is is the top level of tree ( follow in version 1)
+# is black_list is use to filter large scale of dirty data from sql filter state in some other tabel
+---
+tabel 06 : common_meta_data_node
+metadata_id |node_id | source_ID | is_raw | is_root | title | view | update_time |  download_time | auther_description | user | raw_metadata (max1kb) 
+
+# is raw refer to is it the first media or vitral assets input in system by UA_1
+# is_root mean it is  physical media that can consider as direct sample point ( it may consider as a tag that label by DAG but not only determine by DAG, it is abstract meaning in user space)
+-aka image cropped is no root , but key  frame extract in video is root
+
+
+#vitral asset also have common_meta_data 
+
+---
+tabel 07 : 
+# this is a series of tabel define base on differnt source
+Specidic_metadata_tabel07[00-99]_id | node_id   | a list of key meta data sort out by raw metadata by deterministic rule 
+
+Tabel 8 
+relationship _id | description | action_id (accept 0, 0 mean from UA_1)
+# note from UA_1 it can also have more than one relationship as different web scrapped source 
+Tabel 9
+Edge_id | parent_node_id | child_node_id |relationship_id
+
+
+tabel 09 Action tabel
+Action_id | action name | action name | action type
+---
+tabel 10_a Action_batch_ID
+Action_batch_ID  | Create_date | seal_date
+Tabel 10_b Node_enter_batch_record
+Node_enter_batch_record_id | Action_batch_ID | Node_ID | created_date
+
+# use to ensure action batch is seal ( by verify create date)
+---
+tabel 11 action history
+Action_event_id | Action_id | Action_batch_ID | start time | end time | status
+—
+Tabel 12_a pipeline_definition
+# ensure all Node_id in this pipeline_batch is done the follow process
+Pipline_id | pipline_name
+Tabel 12_b pipeline_stage
+# ensure all Node_id in this pipeline_batch is done the follow process
+Pipline_id | stage_id | action_id
+
+(Pipline_id | stage_id ) combine_key
+
+Tabel 12_c
+Action_batch_ID | Pipline_id | current stage
+
+
+# note Action_batch can in multiple pipeline process and different pipeline share some common action. This tabel should generate from tabel 10 11 12 
+
+
+
+Tabel 13 action_result
+
+for all metadata and output, each action should have a define schema in tabel 13 series
+Tabel 13.1 e.g. ocr_detect
+Record_A[[01-99]_ID|Node_ID | position | character
+1|2|(0,0),(15,16)|HelloWorld
+2|2|(15,16),(60,16)|HelloWorld
+
+
+E.g. canny generate 
+Record_132_ID | status
+1| success
+
+Other info , FAQ chat for  reference
+
+這個dag（table 6)關係 是用來篩選哪些數據要放入 batch 然之後密封數據庫(f03即係次次代表爬蟲數據第一次進入系統的批次 和之後的行動批次沒有關係） 現在這些batch完成之後才會放入dataset
+
+實體數據的話就是sha256 image 虛擬資產就是要碰撞 確保 兩個批次的同一個作者可以透過這個地方識別到然後掛在dag 01B是自動備份失敗才會做 是和type 1有關 寫入到s01 就已經使用一個key value media storage 所以01B沒有實際意思
+「補充設計文件（v0.9 草案）」：
+
+0.1 目標
+建立一套可擴展的資料資產平台，支援：
+多來源 web scraping（10–20 sources）→ 統一資產樹（Node/Edge/DAG）→ 可查詢、可追溯
+多類 action（AC1–AC5）含 GPU 與 human-in-loop
+批量排程與批量 I/O（尤其 TYPE2→TYPE3C/TYPE3D）
+多 HDD（大小不一、非 RAID）下的吞吐最佳化、載入平衡、副本（Copy_of_raw 2–4）、壞碟後可停機重建
+0.2 非目標（先明確排除，避免工程擴散）
+不追求無間斷服務（容許 k 硬碟死亡 → 停機維護）
+不要求跨資料中心/跨機房一致性
+不要求 user 在 UA_1 signal 後繼續手動操作 I/O（已列為原則）
+不要求 S02 承載 business logic（S02 只 trigger + monitor）
+
+1. 系統總覽（S01–S08）
+1.1 系統分工（凍結版）
+S01 Storage（核心 I/O）
+管理 TYPE2（多 HDD）與 TYPE3（SSD 3A/3B/3C/3D quota）
+提供穩定 API：BatchWrite、StageTo3C、ExportTo3D、Head/Verify/Health/Rebuild
+實作 load balance、reorder、Copy_of_raw（2–4，後台補齊）、壞碟告警、重建流程
+S02 Scheduler（Dagster UI + Orchestration）
+只負責：觸發、參數傳遞、狀態追蹤、重試、排隊、告警
+不寫 business logic、不直連 storage、不直連 DB
+S03 Adapter/Formatter（契約層 + 意圖生成器）
+對 source：解析 raw_metadata → 生成 SQL write-intent + storage manifest
+對 action：讀 ActionContract（每個 S04 流程）→ 生成 stage layout（3C）+ parse output → SQL write-intent
+僅透過 S01/S05 API
+S04 Cleaning/Worker（GPU/CPU、人手流程執行）
+在另一 VM/節點，唔長期在線
+只遵守固定 input/output 目錄契約（不可改）
+S05 Database（PostgreSQL + API）
+提供 DB I/O API（apply write-intent、query node set、pipeline state）
+備份/健康檢查/還原驗證
+S06 Visualize（簡單可視化）
+讀 S05（和少量 S01 health）展示資產、batch、pipeline、告警
+S07 Dataset_generate（核心 business logic）
+由 S02 觸發
+經 S05 查詢 node 集合 + label → 經 S01 ExportTo3D 落地 dataset
+S08 Testing（contract/integration/unit）
+另一 DB（測試用）
+固定測試資料生成、S01 contract test、S03/S05 交接測試、S04 handoff 測試
+
+2. 儲存分層與目錄規範（TYPE1/2/3）
+2.1 TYPE1 冷存（不納入系統核心）
+由 user 把 TYPE3B 輸出拷到 TYPE1（或後續改成自動化亦可）
+系統只需產出「可搬運的封裝」與「manifest（審計用）」
+2.2 TYPE2 主 HDD（多盤、非 RAID）
+系統主存儲：raw + generated 的長期存放
+需求：2–4 份 Copy_of_raw、副本後台補齊、壞碟可停機重建
+2.3 TYPE3 SSD（單盤分四區：3A/3B/3C/3D）
+3A：user 放入 web-scraped input（UA_1）
+3B：S03/S01 處理後輸出（供 user 搬到 TYPE1）
+3C：worker working area（S04 讀寫）
+3D：dataset export（S07 輸出）
+2.3.1 SSD 軟 quota（必須由 S01 統一管理）
+採用「Quota Reservation + Seal」模型：
+job 開始前計算 expected_bytes → 預留 quota
+copy 寫入 tmp → 校驗 → rename 成正式 → 寫 seal
+成功後扣實際使用；失敗則釋放預留並清理 tmp
+告警閾值（建議預設）：
+warning：每區使用率 ≥ 80%
+hard deny（拒絕新 job）：≥ 90%
+emergency：≥ 95%（僅允許完成中的 job，禁止新 stage/export）
+2.3.2 3C/3D 目錄命名（凍結，便於測試）
+3C：/ssd/3c/<action_batch_id>/<layout_id>/...
+3D：/ssd/3d/<dataset_export_id>/<dataset_layout_id>/...
+seal 檔案：_SEALED（純空檔即可）
+job meta：_JOB.json（記錄 job_id、開始/完結、expected/actual、版本號、manifest hash）
+
+3. 系統常數與建議預設值
+你已列出：
+Copy_of_raw = 2–4
+A4_scale = 10
+以下係我建議的可落地預設（可日後調參，但建議先凍結一套做 S08 測試基準）：
+3.1 shard_size（MB）
+目標：把大量小檔聚合成較大單位，降低 metadata/seek 成本，同時控制重建/搬運粒度。
+建議預設：256 MB
+可調範圍：128–1024 MB
+原則：
+小檔極多 → shard_size 大啲通常更好
+但 shard 太大 → rebuild / 校驗時間長、以及 3C/3D export 可能形成大顆粒 IO 波動
+3.2 batch_size（GB）
+用於 StageTo3C / ExportTo3D 的 job 切分（避免一次性搬走過大、亦方便重試）。
+建議預設：50 GB
+可調範圍：20–200 GB
+原則：
+SSD 1TB，3C/3D 會共用：batch_size 唔應過大，避免碰到 quota deny
+若某 action 產物大（AC4 crop/canny 等）可為該 action 單獨調大/調細
+3.3 replication write-ack 門檻（重要）
+建議固定：至少 2 份 replica 成功並校驗 sha256 → 才算 Put/BatchWrite 成功
+其餘（到 3 或 4）由後台補齊，狀態暴露 replication_lag
+
+4. S01 Storage：接口、語義、狀態機（凍結層）
+S01 的核心價值係「對上層提供穩定 contract」，讓你可以之後改 backend 而唔影響 S03/S07/S04。
+4.1 主要 API（第一期必備）
+4.1.1 BatchWrite（3A/3B → TYPE2）
+入參：manifest（檔案清單 + metadata minimal）
+行為：
+內容尋址（sha256 → node_id）
+寫入 TYPE2，達到 write-ack（2 replicas）即返回成功
+回傳：node_id 對應結果（已有/新寫）、replica_count_current/target、lag
+4.1.2 StageTo3C（TYPE2 → 3C）
+入參：action_batch_id + layout_id + manifest_id|node_id_list
+保障：
+quota reservation
+tmp→seal 原子完成
+允許 reorder（按 shard/volume/disk 分組）
+回傳：
+target_root
+stage_job_id
+expected_bytes/files、quota_reservation_id
+4.1.3 ExportTo3D（TYPE2 → 3D）
+同 StageTo3C，但加上：
+dataset_layout_id
+dedup_mode（by_sha256 / by_node）
+4.1.4 Health / Capacity / Warnings
+GetCapacity()：分區、分 disk 用量
+GetHealth()：disk 狀態、replication lag、最近錯誤、rebuild 建議
+4.1.5 Verify（抽樣校驗）
+Verify(scope=batch|sample_rate)：重新算 hash/size 對照 DB 記錄
+4.2 Copy_of_raw 策略（2–4）
+4.2.1 放置策略（Placement）
+基本原則：同一 node 的 replicas 必須落在不同 HDD（避免單盤失效全損）
+目標：近似均衡各 HDD 的 used_bytes、同時避免單 batch 的熱點集中
+4.2.2 後台補齊（Async replication）
+觸發：
+新寫入未達 target replicas
+某 HDD 下線後造成 replica_count 降低
+調度：
+低優先級、限速（避免干擾前台 StageTo3C/ExportTo3D）
+4.3 壞碟與重建（可停機維護模型）
+偵測：
+I/O error / mount 消失 / SMART（可選）
+行為：
+立刻告警（S06/S02）
+禁止新寫入到該 disk
+若 replica_count 仍 ≥ 2：系統可繼續提供讀（視你是否接受 degraded mode）
+進入維護窗口：更換新 disk → 觸發 Rebuild
+Rebuild 單位：
+以 shard/volume 粒度重建（比 per-file 更可控）
+
+5. S03：契約層（ActionContract）與「SQL 寫入意圖」模型
+你指出的關鍵：S04 流程多、每個格式不同。解法係把「格式差異」收斂成可配置 contract，而唔係寫死在程式邏輯入面。
+5.1 核心概念
+ActionContract（每個 S04 流程一份）
+描述：
+input selector（從 DB 揀 node）
+stage layout（如何落 3C 目錄結構）
+run spec（點觸發 S04）
+output parser（點解析輸出、生成新 node/edge/result）
+SQL write-intent schema（要寫入哪些表、如何 idempotent）
+WriteIntent（S03→S05）
+係一個“DB 寫入計劃”，由 S05 負責：
+驗證欄位/關聯完整性
+transaction
+idempotency（同一 action_event 重入不重複落庫）
+5.2 ActionContract 的最小字段（建議凍結）
+action_id, action_type (AC1–AC5), version
+input_selector（只描述條件，不寫 SQL）
+stage_layout（layout_id、相對路徑規則、sidecar 規則、seal 規則）
+run_spec（script/container 名稱、參數映射 input_root/output_root/action_batch_id）
+output_parser（掃描規則、如何計 sha256、如何生成 child node 與 edge）
+result_mapping（對應 table 13.x）
+5.3 AC 類型處理規範（標準化）
+AC1（純 SQL 空間）
+不經 S01，不 copy data
+S03：提交 selector + SQL write-intent（例如標記/過濾結果）
+AC2（CPU、deterministic、需要 copy 到 3C）
+StageTo3C → run S04 → parse → write-intent
+AC3（GPU、deterministic、需等 GPU node）
+同 AC2，但 S02 排程允許「人手啟動 GPU」或「自動喚起」兩種模式
+AC4（GPU、帶參數、會生成 child data，A4_scale=10）
+output_parser 必須能識別 child 產物並寫入：
+table_00/01A（新 node）
+edge（parent-child）
+table 13.x（action_result）
+AC5（human label，臨時存 3C）
+產物既要可落 DB（label），亦要可追溯（annotation 文件可作附件資產或 virtual asset）
+
+6. S05（PostgreSQL）API 與備份/健康
+6.1 對外 API（最小集合）
+ApplyWriteIntent(intent)：原子、idempotent
+QueryNodes(selector)：供 S03/S07 取輸入集合（含 file_size 聚合供 S01 quota reservation）
+GetPipelineState(action_batch_id|pipeline_id)
+RecordActionHistory(action_event)（可併入 write-intent）
+6.2 備份與驗證（每日）
+備份工具：pgBackRest（你已同意方向）
+每日流程（建議）：
+full/增量備份（視你資料量）
+自動驗證：restore 到測試 DB（S08 的測試環境）跑一次最小查詢/一致性檢查
+生成報告（S06 顯示最近一次 backup 狀態）
+
+7. S02（Dagster）排程模型（不含 business logic）
+7.1 Dagster 只負責三條工作流
+UA_1 Ingest：觸發 S03 source adapter → S01 BatchWrite → S05 ApplyWriteIntent → S01 輸出到 3B（如需要）
+UA_2 Worker：S03 準備 selector → S01 StageTo3C → 觸發 S04 → S03 parse → S05 write →（如 AC4）S01 追加寫入
+UA_3 Dataset：觸發 S07 query → S05 回 node set → S01 ExportTo3D → seal → 完成
+7.2 GPU node 非長在線策略
+兩個模式（contract 一樣，只係 run spec 不同）：
+Manual gate：Dagster job 停在 “WAIT_GPU_READY” step，人手開 VM 後點繼續
+Auto gate（可後續加）：Dagster step call 一個“GPU lifecycle service”喚起/關閉
+
+8. S06 可視化（最小可用）
+Dashboard 分三塊：
+Storage：TYPE3 quota、TYPE2 disk health、replication lag、rebuild queue
+Pipeline：action_batch 列表、stage、最近 runs、失敗原因
+Dataset export：dataset_export_id、目錄、manifest、完成 seal、大小
+
+9. S08 測試策略（你要求的固定資料 + contract）
+9.1 固定測試資料集（必備）
+生成一套 deterministic fixture：
+高比例小檔（對應真實 95%）
+多 source metadata（table_07xx）
+有重複內容但 metadata 不同（同 sha256、不同 common_meta_data_node）
+有 parent/child edge（模擬 crop/frames）
+9.2 必做測試
+S01 Contract Test（最優先）
+BatchWrite → StageTo3C → ExportTo3D 的 seal、hash、size、一致性
+quota reservation 行為（不足時應該在開始前拒絕）
+重入（同一 job 重跑不重複拷貝、不產生半成品）
+S03↔S05 交接測試
+WriteIntent 的 idempotency
+schema 校驗（錯字段應拒絕）
+S04 Handoff 測試
+以 mock output fixture 代替真 S04，驗證 output_parser + write-intent 是否正確落庫
+人手只需保證 S04 真實邏輯正確；系統要保證交接正確
+
+
