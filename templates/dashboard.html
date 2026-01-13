@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Data Curation Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 1rem; background: #0f172a; color: #e2e8f0; }
+        h1, h2 { color: #f8fafc; }
+        .card { background: #111827; padding: 1rem; border-radius: 12px; margin-bottom: 1rem; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        label { display: block; margin-top: 0.5rem; font-size: 0.9rem; }
+        input, textarea { width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #f8fafc; }
+        button { padding: 0.75rem 1rem; border: none; border-radius: 10px; background: linear-gradient(90deg,#06b6d4,#6366f1); color: #0b1220; font-weight: bold; margin-top: 0.75rem; width: 100%; }
+        button:hover { filter: brightness(1.1); cursor: pointer; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+        .pill { background: #1e293b; padding: 0.4rem 0.8rem; border-radius: 999px; font-size: 0.85rem; }
+        .list { list-style: none; padding: 0; margin: 0; }
+        .list li { padding: 0.35rem 0; border-bottom: 1px solid #1f2937; }
+        .muted { color: #94a3b8; font-size: 0.85rem; }
+        .row { display: flex; gap: 0.5rem; align-items: center; }
+        .row input { flex: 1; }
+        .error { color: #f87171; margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+    <h1>Human-in-the-loop Data Curation</h1>
+    <div id="status" class="error"></div>
+    <div class="grid">
+        <div class="card">
+            <h2>Register Workflow</h2>
+            <label>Name</label>
+            <input id="wf-name" />
+            <label>Max Batch Size</label>
+            <input id="wf-batch" type="number" value="4" />
+            <label>Prompt Nodes (comma separated)</label>
+            <input id="wf-prompt" />
+            <label>Seed Nodes (comma separated)</label>
+            <input id="wf-seed" />
+            <label>Workflow Graph JSON</label>
+            <textarea id="wf-graph" rows="6" placeholder='{"nodes":[],"links":[]}'></textarea>
+            <label>Upload workflow JSON</label>
+            <input id="wf-upload" type="file" accept="application/json" />
+            <button onclick="createWorkflow()">Save Workflow</button>
+            <p class="muted">Existing: {{ workflows|length }}</p>
+        </div>
+        <div class="card">
+            <h2>Variable Pool</h2>
+            <label>Name</label><input id="vp-name" />
+            <label>Version</label><input id="vp-version" value="v1" />
+            <label>Sampling Mode</label><input id="vp-mode" value="permutation" />
+            <label>Variables JSON</label>
+            <textarea id="vp-vars" rows="4" placeholder='{"style":["photographic","anime"],"lighting":["soft","hard"]}'></textarea>
+            <button onclick="createVariablePool()">Save Pool</button>
+            <p class="muted">Existing: {{ pools|length }}</p>
+        </div>
+        <div class="card">
+            <h2>GPU Worker</h2>
+            <label>Name</label><input id="wk-name" />
+            <label>Base URL</label><input id="wk-url" placeholder="http://127.0.0.1:8188" />
+            <label>Tags</label><input id="wk-tags" placeholder="sdxl,flux" />
+            <button onclick="registerWorker()">Register & Test</button>
+            <p class="muted">Healthy workers appear after testing.</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Create Task</h2>
+        <label>Workflow</label>
+        <select id="task-workflow">
+            {% for wf in workflows %}
+            <option value="{{ wf.id }}">{{ wf.name }}</option>
+            {% endfor %}
+        </select>
+        <label>Variable Pool</label>
+        <select id="task-pool">
+            {% for pool in pools %}
+            <option value="{{ pool.id }}">{{ pool.name }}:{{ pool.version }}</option>
+            {% endfor %}
+        </select>
+        <label>Prompt Template</label>
+        <input id="task-template" placeholder="Optional when using node input mappings" />
+        <div>
+            <label>Variable → Node Input Mappings</label>
+            <div id="variable-mappings"></div>
+            <button type="button" onclick="addMappingRow()">Add Mapping</button>
+            <p class="muted">Map pool variables to workflow node inputs (node id & input name).</p>
+        </div>
+        <label>Target Prompts</label><input id="task-target" type="number" value="2" />
+        <label>Seeds per Prompt</label><input id="task-seeds" type="number" value="2" />
+        <label>Batch Size</label><input id="task-batch" type="number" value="2" />
+        <label>Client ID</label><input id="task-client" placeholder="Optional client id" />
+        <label>Extra Data (JSON)</label>
+        <textarea id="task-extra" rows="3" placeholder='{"api_key":"..."}'></textarea>
+        <button onclick="createTask()">Create Task</button>
+    </div>
+
+    <div class="card">
+        <h2>Tasks</h2>
+        <ul class="list">
+            {% for task in tasks %}
+            <li>
+                <div><strong>{{ task.id }}</strong> — {{ task.status }} — workflow: {{ task.workflow_id }}</div>
+                <div class="muted">Seeds/Prompt: {{ task.seeds_per_prompt }} | Target Prompts: {{ task.target_prompts }} | Batch: {{ task.batch_size }}</div>
+                <div><a class="pill" href="/tasks/{{ task.id }}">Open Task</a></div>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+
+<script>
+function setStatus(message) {
+    const el = document.getElementById('status');
+    el.textContent = message || '';
+}
+
+document.getElementById('wf-upload').addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+        const text = await file.text();
+        JSON.parse(text);
+        document.getElementById('wf-graph').value = text;
+        setStatus('Loaded workflow JSON from file.');
+    } catch (err) {
+        setStatus('Invalid workflow JSON file.');
+    }
+});
+
+function parseJsonInput(elementId, label) {
+    const raw = document.getElementById(elementId).value.trim();
+    if (!raw) return {};
+    try {
+        return JSON.parse(raw);
+    } catch (err) {
+        throw new Error(`${label} contains invalid JSON.`);
+    }
+}
+
+function addMappingRow(initial = {}) {
+    const container = document.getElementById('variable-mappings');
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `
+        <input placeholder="Variable key" value="${initial.variable || ''}" />
+        <input placeholder="Node ID" value="${initial.node_id || ''}" />
+        <input placeholder="Input name" value="${initial.input_name || ''}" />
+        <button type="button">✕</button>
+    `;
+    row.querySelector('button').onclick = () => container.removeChild(row);
+    container.appendChild(row);
+}
+
+addMappingRow();
+
+async function createWorkflow() {
+    try {
+        const workflowApi = parseJsonInput('wf-graph', 'Workflow graph');
+        const payload = {
+            name: document.getElementById('wf-name').value,
+            max_workflow_batch_size: Number(document.getElementById('wf-batch').value),
+            prompt_nodes: document.getElementById('wf-prompt').value.split(',').filter(Boolean),
+            seed_nodes: document.getElementById('wf-seed').value.split(',').filter(Boolean),
+            workflow_api: workflowApi,
+        };
+        await fetch('/admin/workflows', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        location.reload();
+    } catch (err) {
+        setStatus(err.message);
+    }
+}
+async function createVariablePool() {
+    const payload = {
+        name: document.getElementById('vp-name').value,
+        version: document.getElementById('vp-version').value,
+        sampling_mode: document.getElementById('vp-mode').value,
+        variables: JSON.parse(document.getElementById('vp-vars').value || '{}')
+    };
+    await fetch('/admin/variable-pools', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    location.reload();
+}
+async function registerWorker() {
+    const payload = {
+        name: document.getElementById('wk-name').value,
+        base_url: document.getElementById('wk-url').value,
+        tags: document.getElementById('wk-tags').value.split(',').filter(Boolean),
+        enabled: true,
+        max_concurrent_jobs: 1
+    };
+    await fetch('/admin/workers', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    await fetch('/admin/workers/health', {method:'POST'});
+    location.reload();
+}
+async function createTask() {
+    try {
+        const extraData = parseJsonInput('task-extra', 'Extra data');
+        const mappings = Array.from(document.getElementById('variable-mappings').children).map(row => {
+            const [variableEl, nodeEl, inputEl] = row.querySelectorAll('input');
+            return {
+                variable: variableEl.value.trim(),
+                node_id: nodeEl.value.trim(),
+                input_name: inputEl.value.trim()
+            };
+        }).filter(m => m.variable && m.node_id && m.input_name);
+        const payload = {
+            workflow_id: document.getElementById('task-workflow').value,
+            variable_pool_id: document.getElementById('task-pool').value,
+            prompt_template: document.getElementById('task-template').value,
+            variable_input_mappings: mappings,
+            batch_size: Number(document.getElementById('task-batch').value),
+            seeds_per_prompt: Number(document.getElementById('task-seeds').value),
+            target_prompts: Number(document.getElementById('task-target').value),
+            client_id: document.getElementById('task-client').value || null,
+            extra_data: extraData
+        };
+        await fetch('/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        location.reload();
+    } catch (err) {
+        setStatus(err.message);
+    }
+}
+</script>
+</body>
+</html>

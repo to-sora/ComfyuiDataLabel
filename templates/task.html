@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Task {{ task.id }}</title>
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+        body { font-family: "Inter", system-ui, -apple-system, sans-serif; margin: 0; padding: 1rem; background: #0f172a; color: #e2e8f0; }
+        h1, h2, h3 { margin: 0 0 0.5rem; }
+        .card { background: #111827; padding: 1rem; border-radius: 14px; margin-bottom: 1rem; box-shadow: 0 12px 30px rgba(0,0,0,0.25); }
+        .actions-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+        button { padding: 0.6rem 1rem; border: none; border-radius: 10px; background: #22d3ee; color: #0b1220; font-weight: 700; cursor: pointer; transition: transform 0.15s ease, box-shadow 0.15s ease; }
+        button:hover { transform: translateY(-1px); box-shadow: 0 8px 16px rgba(34,211,238,0.2); }
+        button.secondary { background: #0ea5e9; color: #0b1220; }
+        button.ghost { background: transparent; color: #e2e8f0; border: 1px solid #1f2937; }
+        .prompt-card { padding: 0.75rem; background: #0b1220; border-radius: 10px; margin-bottom: 1rem; border: 1px solid #1f2937; }
+        .prompt-header { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.5rem; }
+        .prompt-text { line-height: 1.5; }
+        .badge { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.2rem 0.65rem; border-radius: 999px; background: #1f2937; color: #cbd5e1; font-size: 0.85rem; }
+        .annotation { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+        .annotation button { width: 100%; }
+        .gallery { display: flex; flex-direction: column; gap: 0.75rem; }
+        .image-stage { position: relative; overflow: hidden; border-radius: 12px; border: 1px solid #1f2937; background: radial-gradient(circle at 20% 20%, #0f172a, #0b1220); min-height: 320px; max-height: 70vh; display: flex; align-items: center; justify-content: center; touch-action: none; }
+        .image-stage img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; will-change: transform; transition: transform 0.08s ease-out; }
+        .image-meta { position: absolute; top: 12px; left: 12px; background: rgba(15,23,42,0.8); border: 1px solid #1f2937; padding: 0.3rem 0.55rem; border-radius: 999px; font-size: 0.9rem; display: flex; align-items: center; gap: 0.35rem; }
+        .image-meta span { color: #a5b4fc; }
+        .thumb-strip { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(72px, 1fr); gap: 0.5rem; overflow-x: auto; padding-bottom: 0.35rem; scrollbar-width: thin; }
+        .thumb { position: relative; border: 1px solid #1f2937; border-radius: 10px; overflow: hidden; background: #111827; cursor: pointer; transition: border-color 0.15s ease, transform 0.1s ease; }
+        .thumb img { width: 100%; height: 72px; object-fit: cover; display: block; }
+        .thumb .seed-label { position: absolute; bottom: 4px; right: 6px; background: rgba(15,23,42,0.8); border-radius: 8px; padding: 0.1rem 0.35rem; font-size: 0.75rem; color: #cbd5e1; }
+        .thumb.active { border-color: #22d3ee; box-shadow: 0 0 0 2px rgba(34,211,238,0.35); transform: translateY(-1px); }
+        .selection-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; font-size: 0.95rem; color: #cbd5e1; }
+        .selection-pill { padding: 0.25rem 0.55rem; border-radius: 999px; background: #1f2937; border: 1px solid #1f2937; display: inline-flex; align-items: center; gap: 0.35rem; }
+        .selection-pill strong { color: #f8fafc; }
+        .empty-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 0.95rem; text-align: center; padding: 1rem; }
+        .muted { color: #94a3b8; font-size: 0.9rem; }
+        .cta-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.5rem; margin-top: 0.5rem; }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+            100% { transform: scale(1); }
+        }
+        .pulse { animation: pulse 0.2s ease; }
+        @media (max-width: 640px) {
+            body { padding: 0.75rem; }
+            .card { padding: 0.85rem; }
+            .image-stage { min-height: 280px; }
+        }
+    </style>
+</head>
+<body>
+    <a href="/" style="color:#38bdf8">← Back</a>
+    <h1>Task {{ task.id }}</h1>
+    <div class="muted">Status: {{ task.status }} | Workflow: {{ task.workflow_id }}</div>
+
+    <div class="card">
+        <button onclick="pilot()">Run Pilot</button>
+        <button onclick="freezeTask()">Freeze</button>
+        <button onclick="generate()">Mass Generate</button>
+    </div>
+
+    <div class="card">
+        <h2>Prompts & Seeds</h2>
+        <div class="muted" style="margin-bottom:0.75rem">Swipe between variants, pinch to zoom, and select directly from the displayed images.</div>
+        {% for prompt in prompts %}
+        {% set images = prompt.node_outputs.get('images', []) if prompt.node_outputs else [] %}
+        {% set seeds = prompt.seed_list if prompt.seed_list else [prompt.seed] %}
+        <div class="prompt-card" data-prompt-id="{{ prompt.id }}" data-images='{{ images|tojson }}' data-seeds='{{ seeds|tojson }}'>
+            <div class="prompt-header">
+                <div class="prompt-text">{{ prompt.prompt }}</div>
+                <div class="muted">Primary seed: {{ prompt.seed }} | mode: {{ prompt.mode }} | batch size: {{ prompt.batch_size }}</div>
+            </div>
+            <div class="gallery">
+                <div class="image-stage" data-prompt="{{ prompt.id }}">
+                    <div class="image-meta">
+                        <span>Seed</span>
+                        <strong class="current-seed">{{ seeds[0] if seeds else '-' }}</strong>
+                        <span class="muted">(<span class="current-index">1</span>/<span class="total-count">{{ images|length if images else 1 }}</span>)</span>
+                    </div>
+                    <img alt="Variant preview" draggable="false" />
+                </div>
+                <div class="thumb-strip"></div>
+            </div>
+            <div class="selection-bar">
+                <div class="selection-pill">
+                    <span>Chosen:</span> <strong class="chosen-label">None</strong>
+                </div>
+                <div class="selection-pill">
+                    <span>Rejected:</span> <strong class="rejected-label">None</strong>
+                </div>
+                <div class="selection-pill">
+                    <span>Spam:</span> <strong class="spam-label">No</strong>
+                </div>
+            </div>
+            <div class="cta-row">
+                <button onclick="markChosen('{{ prompt.id }}')">Choose This Variant</button>
+                <button class="secondary" onclick="markRejected('{{ prompt.id }}')">Reject This Variant</button>
+                <button class="ghost" onclick="toggleSpam('{{ prompt.id }}')">Toggle Spam</button>
+            </div>
+            <div class="annotation">
+                <div class="actions">
+                    <button onclick="annotate('{{ prompt.id }}')">Save Annotation</button>
+                    <button class="secondary" onclick="markSpamOnly('{{ prompt.id }}')">Spam Only</button>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+<script>
+async function pilot(){ await fetch(`/tasks/{{ task.id }}/pilot`, {method:'POST'}); location.reload(); }
+async function freezeTask(){ await fetch(`/tasks/{{ task.id }}/freeze`, {method:'POST'}); location.reload(); }
+async function generate(){ await fetch(`/tasks/{{ task.id }}/generate`, {method:'POST'}); location.reload(); }
+const promptStates = {};
+const promptCards = Array.from(document.querySelectorAll('.prompt-card'));
+
+function normalizeImages(images){
+    if(!Array.isArray(images)){
+        return [];
+    }
+    return images.map(src => typeof src === 'string' && src.startsWith('data:') ? src : `data:image/png;base64,${src}`);
+}
+
+function clamp(value, min, max){ return Math.min(Math.max(value, min), max); }
+
+function updateSelectionLabels(card, state){
+    const chosenLabel = card.querySelector('.chosen-label');
+    const rejectedLabel = card.querySelector('.rejected-label');
+    const spamLabel = card.querySelector('.spam-label');
+    chosenLabel.textContent = state.chosenIndex !== null ? `#${state.chosenIndex} (seed ${state.seeds[state.chosenIndex] ?? state.seeds[0] ?? '-'})` : 'None';
+    rejectedLabel.textContent = state.rejectedIndex !== null ? `#${state.rejectedIndex} (seed ${state.seeds[state.rejectedIndex] ?? state.seeds[0] ?? '-'})` : 'None';
+    spamLabel.textContent = state.spam ? 'Yes' : 'No';
+}
+
+function renderVariant(card, state){
+    const imgEl = card.querySelector('.image-stage img');
+    const seedLabel = card.querySelector('.current-seed');
+    const idxLabel = card.querySelector('.current-index');
+    const totalLabel = card.querySelector('.total-count');
+    const thumbs = card.querySelectorAll('.thumb');
+    const activeSrc = state.images[state.currentIndex];
+    if(activeSrc){
+        imgEl.src = activeSrc;
+    } else {
+        imgEl.removeAttribute('src');
+    }
+    seedLabel.textContent = state.seeds[state.currentIndex] ?? state.seeds[0] ?? '-';
+    idxLabel.textContent = (state.currentIndex + 1).toString();
+    totalLabel.textContent = state.images.length || 1;
+    thumbs.forEach((thumb, idx) => {
+        thumb.classList.toggle('active', idx === state.currentIndex);
+    });
+    updateSelectionLabels(card, state);
+    applyTransform(imgEl, state);
+}
+
+function applyTransform(imgEl, state){
+    imgEl.style.transform = `translate3d(${state.offsetX}px, ${state.offsetY}px, 0) scale(${state.scale})`;
+}
+
+function resetTransform(state){
+    state.scale = 1;
+    state.offsetX = 0;
+    state.offsetY = 0;
+}
+
+function queueRender(card, state){
+    if(state.raf){ return; }
+    state.raf = requestAnimationFrame(() => {
+        renderVariant(card, state);
+        state.raf = null;
+    });
+}
+
+function handleSwipe(card, state, direction){
+    if(direction === 'left' && state.currentIndex < state.images.length - 1){
+        state.currentIndex += 1;
+    }
+    if(direction === 'right' && state.currentIndex > 0){
+        state.currentIndex -= 1;
+    }
+    resetTransform(state);
+    renderVariant(card, state);
+}
+
+function initInteractions(card, state){
+    const stage = card.querySelector('.image-stage');
+    const imgEl = stage.querySelector('img');
+    let touchStart = null;
+    let pinchStartDistance = null;
+    let pinchStartScale = 1;
+
+    const distance = (touches) => {
+        const [a, b] = touches;
+        const dx = a.clientX - b.clientX;
+        const dy = a.clientY - b.clientY;
+        return Math.hypot(dx, dy);
+    };
+
+    stage.addEventListener('touchstart', (e) => {
+        if(e.touches.length === 1){
+            touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, time: performance.now() };
+        }
+        if(e.touches.length === 2){
+            pinchStartDistance = distance(e.touches);
+            pinchStartScale = state.scale;
+        }
+    }, { passive: true });
+
+    stage.addEventListener('touchmove', (e) => {
+        if(e.touches.length === 2 && pinchStartDistance){
+            const dist = distance(e.touches);
+            const delta = dist / pinchStartDistance;
+            state.scale = clamp(pinchStartScale * delta, 1, 3);
+            queueRender(card, state);
+            e.preventDefault();
+            return;
+        }
+        if(state.scale > 1 && e.touches.length === 1 && touchStart){
+            const dx = e.touches[0].clientX - touchStart.x;
+            const dy = e.touches[0].clientY - touchStart.y;
+            state.offsetX = clamp(state.offsetX + dx, -300, 300);
+            state.offsetY = clamp(state.offsetY + dy, -300, 300);
+            touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, time: touchStart.time };
+            queueRender(card, state);
+            e.preventDefault();
+        }
+    }, { passive: false });
+
+    stage.addEventListener('touchend', (e) => {
+        if(pinchStartDistance && e.touches.length < 2){
+            pinchStartDistance = null;
+        }
+        if(!touchStart){ return; }
+        const dx = (e.changedTouches[0]?.clientX || 0) - touchStart.x;
+        const dy = (e.changedTouches[0]?.clientY || 0) - touchStart.y;
+        const dt = performance.now() - touchStart.time;
+        const horizontalSwipe = Math.abs(dx) > 50 && Math.abs(dy) < 60 && dt < 400;
+        if(state.scale === 1 && horizontalSwipe){
+            handleSwipe(card, state, dx < 0 ? 'left' : 'right');
+        }
+        touchStart = null;
+    });
+
+    stage.addEventListener('wheel', (e) => {
+        if(!e.ctrlKey){ return; }
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? 0.1 : -0.1;
+        state.scale = clamp(state.scale + delta, 1, 3);
+        queueRender(card, state);
+    }, { passive: false });
+
+    stage.addEventListener('dblclick', () => {
+        resetTransform(state);
+        renderVariant(card, state);
+    });
+
+    stage.addEventListener('click', () => {
+        imgEl.classList.add('pulse');
+        setTimeout(() => imgEl.classList.remove('pulse'), 180);
+    });
+}
+
+function initThumbnails(card, state){
+    const strip = card.querySelector('.thumb-strip');
+    strip.innerHTML = '';
+    if(!state.images.length){
+        strip.innerHTML = '<div class="muted">No images available for this prompt.</div>';
+        return;
+    }
+    state.images.forEach((src, idx) => {
+        const thumb = document.createElement('div');
+        thumb.className = 'thumb';
+        const img = document.createElement('img');
+        img.src = src;
+        const badge = document.createElement('div');
+        badge.className = 'seed-label';
+        badge.textContent = state.seeds[idx] ?? state.seeds[0] ?? '-';
+        thumb.appendChild(img);
+        thumb.appendChild(badge);
+        thumb.addEventListener('click', () => {
+            state.currentIndex = idx;
+            resetTransform(state);
+            renderVariant(card, state);
+        });
+        strip.appendChild(thumb);
+    });
+}
+
+function preloadPrompt(index){
+    const card = promptCards[index];
+    if(!card){ return; }
+    const images = normalizeImages(JSON.parse(card.dataset.images || '[]'));
+    images.forEach((src) => { const img = new Image(); img.src = src; });
+}
+
+function initPrompt(promptId){
+    const card = document.querySelector(`.prompt-card[data-prompt-id="${promptId}"]`);
+    if(!card){ return; }
+    const images = normalizeImages(JSON.parse(card.dataset.images || '[]'));
+    const seedsRaw = JSON.parse(card.dataset.seeds || '[]');
+    const seeds = Array.isArray(seedsRaw) ? seedsRaw : [];
+    const stage = card.querySelector('.image-stage');
+    if(stage && !images.length){
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = 'No images available for this prompt yet.';
+        stage.appendChild(empty);
+    }
+    promptStates[promptId] = {
+        images,
+        seeds,
+        currentIndex: 0,
+        chosenIndex: null,
+        rejectedIndex: null,
+        spam: false,
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        raf: null,
+    };
+    const state = promptStates[promptId];
+    initThumbnails(card, state);
+    initInteractions(card, state);
+    renderVariant(card, state);
+}
+
+promptCards.forEach((card, idx) => {
+    const id = card.dataset.promptId;
+    initPrompt(id);
+    preloadPrompt(idx + 1);
+});
+
+function markChosen(promptId){
+    const state = promptStates[promptId];
+    if(!state){ return; }
+    state.chosenIndex = state.currentIndex;
+    state.rejectedIndex = state.rejectedIndex === state.chosenIndex ? null : state.rejectedIndex;
+    state.spam = false;
+    const card = document.querySelector(`.prompt-card[data-prompt-id="${promptId}"]`);
+    updateSelectionLabels(card, state);
+}
+
+function markRejected(promptId){
+    const state = promptStates[promptId];
+    if(!state){ return; }
+    if(state.chosenIndex !== null && state.currentIndex === state.chosenIndex){
+        state.rejectedIndex = null;
+        alert('Rejected variant cannot match the chosen one. Pick another image to reject.');
+    } else {
+        state.rejectedIndex = state.currentIndex;
+    }
+    const card = document.querySelector(`.prompt-card[data-prompt-id="${promptId}"]`);
+    updateSelectionLabels(card, state);
+}
+
+function toggleSpam(promptId){
+    const state = promptStates[promptId];
+    if(!state){ return; }
+    state.spam = !state.spam;
+    if(state.spam){
+        state.chosenIndex = null;
+        state.rejectedIndex = null;
+    }
+    const card = document.querySelector(`.prompt-card[data-prompt-id="${promptId}"]`);
+    updateSelectionLabels(card, state);
+}
+
+function buildAnnotationPayload(promptId, spamOnly=false){
+    const state = promptStates[promptId];
+    if(!state){ return { chosen_index: null, rejected_index: null, spam: false }; }
+    if(spamOnly){
+        state.spam = true;
+        state.chosenIndex = null;
+        state.rejectedIndex = null;
+    }
+    return {
+        chosen_index: state.chosenIndex,
+        rejected_index: state.rejectedIndex,
+        spam: state.spam,
+    };
+}
+
+async function annotate(promptId){
+    const payload = buildAnnotationPayload(promptId);
+    if(!payload.spam && payload.chosen_index === null){
+        alert('Please choose a variant before saving.');
+        return;
+    }
+    await fetch(`/prompts/${promptId}/annotations`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    alert('Saved annotation for '+promptId);
+}
+
+async function markSpamOnly(promptId){
+    const payload = buildAnnotationPayload(promptId, true);
+    const card = document.querySelector(`.prompt-card[data-prompt-id="${promptId}"]`);
+    const state = promptStates[promptId];
+    if(card && state){
+        updateSelectionLabels(card, state);
+    }
+    await fetch(`/prompts/${promptId}/annotations`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    alert('Saved spam annotation for '+promptId);
+}
+</script>
+</body>
+</html>
